@@ -26,9 +26,24 @@ namespace UglyToad.PdfPig.Filters.Jpx.OpenJpeg
             // OpenJpeg.Net uses the OpenJpeg 1.4 API
             var cInfo = new CompressionInfo(true, codecFormat);
 
+            // PDF 2.0, 7.4.9: when the image dictionary has its own /ColorSpace entry, that colour
+            // space governs how the decoded samples are interpreted - not any colour space info
+            // embedded in the JPEG2000 data. If the JP2 also embeds a palette (pclr/cmap boxes),
+            // e.g. because /ColorSpace is itself Indexed, the raw codestream only carries one
+            // component (a palette index) per pixel. Left to its own devices the decoder applies
+            // that embedded palette automatically and hands back 3-component RGB samples instead,
+            // which no longer matches what the declared /ColorSpace (and PdfPig's colour-space byte
+            // converter) expects - corrupting the image (see Caly issue: JPXDecode + Indexed
+            // /ColorSpace renders as scrambled noise). Suppress the automatic palette application in
+            // that case so the filter always returns raw per-codestream-component samples.
+            bool hasExplicitColorSpace = streamDictionary.ContainsKey(NameToken.ColorSpace);
+
             // Sets up decoding parameters. Can for instance be used to
             // speed up decoding of thumbnails by decoding less resolutions
-            var parameters = new DecompressionParameters();
+            var parameters = new DecompressionParameters
+            {
+                IgnoreColorLookupTable = hasExplicitColorSpace
+            };
 
             // Destination for the decoded image
             JPXImage? img = null;
@@ -72,9 +87,16 @@ namespace UglyToad.PdfPig.Filters.Jpx.OpenJpeg
             // to work with.
             img.MakeUniformBPC();
 
-            // Jpeg 2000 images can have a color palette, this removes
-            // that.
-            img.ApplyIndex();
+            // Jpeg 2000 images can have a color palette. Only apply it here when the PDF itself
+            // doesn't declare a /ColorSpace: in that case PdfPig falls back to the colour space
+            // embedded in the JPX data (Jpeg2000Helper.GetJpxColorSpaceDetails), which expects
+            // palette-expanded samples. When /ColorSpace is present, IgnoreColorLookupTable above
+            // already suppressed the automatic application, and the raw index samples must be left
+            // alone for the declared /ColorSpace (and its own lookup table) to interpret.
+            if (!hasExplicitColorSpace)
+            {
+                img.ApplyIndex();
+            }
 
             //Handle some color spaces.
             switch (img.ColorSpace)
