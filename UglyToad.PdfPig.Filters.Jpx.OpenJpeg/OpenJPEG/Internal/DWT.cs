@@ -1,4 +1,7 @@
-﻿#region License
+﻿using System.Buffers;
+using System.Numerics;
+using System.Runtime.InteropServices;
+#region License
 /*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
@@ -63,14 +66,17 @@ namespace OpenJpeg.Internal
         const float dwt_delta = 0.443506852f; //  -3633
 
         /// <summary>
-        /// Number of int32 values in a SSE2 register
+        /// Number of int32 values per SIMD register, as in upstream's AVX2 build (16 columns per 5/3 vertical pass).
+        /// The vector code handles this with one or more Vector&lt;int&gt; per half.
         /// </summary>
-        /// <remarks>
-        /// We don't currently support SSE2, but maybe in the future
-        /// </remarks>
-        const uint VREG_INT_COUNT = 4;
+        const uint VREG_INT_COUNT = 8;
         const uint PARALLEL_COLS_53 = 2 * VREG_INT_COUNT;
         const int NB_ELTS_V8 = 8;
+        /// <summary>Floats per Vector&lt;float&gt;, and vectors per NB_ELTS_V8 wavelet element.</summary>
+        static readonly int VecF = Vector<float>.Count;
+        static readonly int VecPerElt = NB_ELTS_V8 / Math.Max(1, Vector<float>.Count);
+        /// <summary>SIMD path for the 9/7 lifting steps, when vectors are hardware accelerated and fit an element.</summary>
+        static readonly bool UseVectors = Vector.IsHardwareAccelerated && NB_ELTS_V8 % Vector<float>.Count == 0;
 
         /// <summary>
         /// This table contains the norms of the 9-7 wavelets for different bands.
@@ -123,8 +129,7 @@ namespace OpenJpeg.Internal
             bool disable_multi_threading)
         {
             int num_threads;
-            ThreadPool.GetAvailableThreads(out num_threads, out _);
-            num_threads = disable_multi_threading ? 1 : Math.Min(Environment.ProcessorCount, num_threads);
+            num_threads = Parallelism.ThreadCount(disable_multi_threading);
 
             int[] tiledp = tilec.data;
 
@@ -142,8 +147,7 @@ namespace OpenJpeg.Internal
             int[] bj = new int[data_size];
             int i = l;
 
-            using (var reset = new ManualResetEvent(false))
-            {
+                        {
                 while (i-- != 0)
                 {
                     //Width of the resolution level computed
@@ -191,16 +195,13 @@ namespace OpenJpeg.Internal
 
                         uint step_j = ((rw / (uint)num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
 
-                        reset.Reset();
-                        //Alternativly, we can set this to num_jobs and remove the Interlocked.Increment
-                        //and the Interlocked.Decrement after the for loop
-                        int n_thread_workers = 1;
+                        var jobs = new List<encode_v_job>(num_jobs);
 
                         for (uint j = 0; j < num_jobs; j++)
                         {
                             var job = new encode_v_job(
                                 new dwt_local() { 
-                                    mem = new int[data_size],
+                                    mem = ArrayPool<int>.Shared.Rent((int)data_size),
                                     dn = dn,
                                     sn = sn,
                                     cas = cas_col
@@ -214,20 +215,10 @@ namespace OpenJpeg.Internal
                                 encode_and_deinterleave_v
                              );
 
-                            Interlocked.Increment(ref n_thread_workers);
-                            ThreadPool.QueueUserWorkItem((x) =>
-                            {
-                                try { encode_v_func((encode_v_job)x); }
-                                finally
-                                {
-                                    if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                                        reset.Set();
-                                }
-                            }, job);
+                            jobs.Add(job);
                         }
-                        if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                            reset.Set();
-                        reset.WaitOne();
+                        Parallelism.RunAll(jobs, encode_v_func);
+                        foreach (var job in jobs) ArrayPool<int>.Shared.Return(job.v.mem);
                     }
 
                     sn = (int)rw1;
@@ -252,10 +243,7 @@ namespace OpenJpeg.Internal
 
                         uint step_j = rh / (uint)num_jobs;
 
-                        reset.Reset();
-                        //Alternativly, we can set this to num_jobs and remove the Interlocked.Increment
-                        //and the Interlocked.Decrement after the for loop
-                        int n_thread_workers = 1;
+                        var jobs = new List<encode_h_job>(num_jobs);
 
                         for (uint j = 0; j < num_jobs; j++)
                         {
@@ -266,7 +254,7 @@ namespace OpenJpeg.Internal
                             var job = new encode_h_job(
                                 new dwt_local()
                                 {
-                                    mem = new int[data_size],
+                                    mem = ArrayPool<int>.Shared.Rent((int)data_size),
                                     dn = dn,
                                     sn = sn,
                                     cas = cas_row
@@ -280,20 +268,10 @@ namespace OpenJpeg.Internal
                                 encode_and_deinterleave_h_one_row
                              );
 
-                            Interlocked.Increment(ref n_thread_workers);
-                            ThreadPool.QueueUserWorkItem((x) =>
-                            {
-                                try { encode_h_func((encode_h_job)x); }
-                                finally
-                                {
-                                    if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                                        reset.Set();
-                                }
-                            }, job);
+                            jobs.Add(job);
                         }
-                        if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                            reset.Set();
-                        reset.WaitOne();
+                        Parallelism.RunAll(jobs, encode_h_func);
+                        foreach (var job in jobs) ArrayPool<int>.Shared.Return(job.h.mem);
                     }
 
                     cur_res = last_res;
@@ -660,10 +638,7 @@ namespace OpenJpeg.Internal
             {
                 return true;
             }
-            ThreadPool.GetAvailableThreads(out num_threads, out _);
-            num_threads = Math.Min(Environment.ProcessorCount, num_threads);
-            if (disable_multi_threading)
-                num_threads = 0;
+            num_threads = disable_multi_threading ? 0 : Parallelism.ThreadCount(false);
 
             data_size = MaxResolution(res_ar, (int)numres);
             /* overflow check */
@@ -675,11 +650,11 @@ namespace OpenJpeg.Internal
             h.wavelet = new float[data_size * NB_ELTS_V8];
             v.wavelet = h.wavelet;
 
-            using (var reset = new ManualResetEvent(false))
-            {
+                        {
                 while (--numres != 0)
                 {
                     int[] aj_ar = tilec.data;
+                    var ajf = MemoryMarshal.Cast<int, float>(aj_ar.AsSpan()); // tile data holds float bits here
                     int aj = 0, j;
 
                     h.sn = (int)rw;
@@ -720,26 +695,18 @@ namespace OpenJpeg.Internal
                                 //floating points. Here it's stored as a continuous array, this
                                 //is why we have to multiply k with 8. 
                                 int k_wavelet = k * NB_ELTS_V8;
-                                fi.F = h.wavelet[k_wavelet + 0];
-                                aj_ar[aj + k] = fi.I;
-                                fi.F = h.wavelet[k_wavelet + 1];
-                                aj_ar[aj + k + w] = fi.I;
-                                fi.F = h.wavelet[k_wavelet + 2];
-                                aj_ar[aj + k + w * 2] = fi.I;
-                                fi.F = h.wavelet[k_wavelet + 3];
-                                aj_ar[aj + k + w * 3] = fi.I;
+                                ajf[aj + k] = h.wavelet[k_wavelet + 0];
+                                ajf[aj + k + w] = h.wavelet[k_wavelet + 1];
+                                ajf[aj + k + w * 2] = h.wavelet[k_wavelet + 2];
+                                ajf[aj + k + w * 3] = h.wavelet[k_wavelet + 3];
                             }
                             for (int k = 0; k < rw; k++)
                             {
                                 int k_wavelet = k * NB_ELTS_V8;
-                                fi.F = h.wavelet[k_wavelet + 4];
-                                aj_ar[aj + k + w * 4] = fi.I;
-                                fi.F = h.wavelet[k_wavelet + 5];
-                                aj_ar[aj + k + w * 5] = fi.I;
-                                fi.F = h.wavelet[k_wavelet + 6];
-                                aj_ar[aj + k + w * 6] = fi.I;
-                                fi.F = h.wavelet[k_wavelet + 7];
-                                aj_ar[aj + k + w * 7] = fi.I;
+                                ajf[aj + k + w * 4] = h.wavelet[k_wavelet + 4];
+                                ajf[aj + k + w * 5] = h.wavelet[k_wavelet + 5];
+                                ajf[aj + k + w * 6] = h.wavelet[k_wavelet + 6];
+                                ajf[aj + k + w * 7] = h.wavelet[k_wavelet + 7];
                             }
 
                             aj += w * NB_ELTS_V8;
@@ -756,10 +723,7 @@ namespace OpenJpeg.Internal
 
                         uint step_j = ((rh / (uint)num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
 
-                        reset.Reset();
-                        //Alternativly, we can set this to num_jobs and remove the Interlocked.Increment
-                        //and the Interlocked.Decrement after the for loop
-                        int n_thread_workers = 1;
+                        var jobs = new List<dwt97_decode_h_job>(num_jobs);
 
                         for (j = 0; j < num_jobs; j++)
                         {
@@ -767,24 +731,14 @@ namespace OpenJpeg.Internal
                                 h.Clone(), rw, (uint)w, aj_ar, aj,
                                 (j + 1 == num_jobs) ? (rh & unchecked((uint)~(NB_ELTS_V8 - 1))) - (uint)j * step_j : step_j
                             );
-                            job.h.wavelet = new float[h.wavelet.Length];
+                            job.h.wavelet = ArrayPool<float>.Shared.Rent(h.wavelet.Length);
 
                             aj += (int)(w * job.nb_rows);
 
-                            Interlocked.Increment(ref n_thread_workers);
-                            ThreadPool.QueueUserWorkItem((x) =>
-                            {
-                                try { dwt97_decode_h_func((dwt97_decode_h_job)x); }
-                                finally
-                                {
-                                    if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                                        reset.Set();
-                                }
-                            }, job);
+                            jobs.Add(job);
                         }
-                        if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                            reset.Set();
-                        reset.WaitOne();
+                        Parallelism.RunAll(jobs, dwt97_decode_h_func);
+                        foreach (var job in jobs) ArrayPool<float>.Shared.Return(job.h.wavelet);
                         j = (int)(rh & unchecked((uint)~(NB_ELTS_V8 - 1)));
                     }
 
@@ -799,8 +753,7 @@ namespace OpenJpeg.Internal
                             int k_wavelet = k * NB_ELTS_V8, ajk = aj + k;
                             for (uint l = 0; l < rh - j; l++)
                             {
-                                fi.F = h.wavelet[k_wavelet + l];
-                                aj_ar[ajk + w * l] = fi.I;
+                                ajf[(int)(ajk + w * l)] = h.wavelet[k_wavelet + l];
                             }
                         }
                     }
@@ -847,10 +800,7 @@ namespace OpenJpeg.Internal
 
                         uint step_j = ((rw / (uint)num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
 
-                        reset.Reset();
-                        //Alternativly, we can set this to num_jobs and remove the Interlocked.Increment
-                        //and the Interlocked.Decrement after the for loop
-                        int n_thread_workers = 1;
+                        var jobs = new List<dwt97_decode_v_job>(num_jobs);
 
                         for (j = 0; j < num_jobs; j++)
                         {
@@ -858,24 +808,14 @@ namespace OpenJpeg.Internal
                                 v.Clone(), rh, (uint)w, aj_ar, aj,
                                 (j + 1 == num_jobs) ? (rw & unchecked((uint)~(NB_ELTS_V8 - 1))) - (uint)j * step_j : step_j
                             );
-                            job.v.wavelet = new float[v.wavelet.Length];
+                            job.v.wavelet = ArrayPool<float>.Shared.Rent(v.wavelet.Length);
 
                             aj += (int)(job.nb_columns);
 
-                            Interlocked.Increment(ref n_thread_workers);
-                            ThreadPool.QueueUserWorkItem((x) =>
-                            {
-                                try { dwt97_decode_v_func((dwt97_decode_v_job)x); }
-                                finally
-                                {
-                                    if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                                        reset.Set();
-                                }
-                            }, job);
+                            jobs.Add(job);
                         }
-                        if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                            reset.Set();
-                        reset.WaitOne();
+                        Parallelism.RunAll(jobs, dwt97_decode_v_func);
+                        foreach (var job in jobs) ArrayPool<float>.Shared.Return(job.v.wavelet);
                     }
 
                     //Makes sure not not overflow the array by copying "less than 4 floats".
@@ -976,6 +916,21 @@ namespace OpenJpeg.Internal
         /// <param name="c">Some constant</param>
         private static void v8dwt_decode_step1(float[] f, int fw, int start, int end, float c)
         {
+            if (UseVectors)
+            {
+                // Each wavelet element is NB_ELTS_V8 floats: one or two Vector<float>. Same single multiply
+                // per lane as the scalar code, so the result is bit-identical (like upstream's SSE/AVX path).
+                var v = MemoryMarshal.Cast<float, Vector<float>>(f.AsSpan());
+                var vc = new Vector<float>(c);
+                for (int i = start; i < end; ++i)
+                {
+                    int e = (fw + i * 2 * NB_ELTS_V8) / VecF;
+                    for (int k = 0; k < VecPerElt; k++)
+                        v[e + k] *= vc;
+                }
+                return;
+            }
+
             // To be adapted if NB_ELTS_V8 changes
             for (int i = start; i < end; ++i)
             {
@@ -1073,6 +1028,30 @@ namespace OpenJpeg.Internal
             {
                 fw += 2 * NB_ELTS_V8 * start;
                 fl = fw - 2 * NB_ELTS_V8;
+            }
+            if (UseVectors)
+            {
+                // f[w - 1] += (f[l] + f[w]) * c, lane-wise; same operation order as the scalar code.
+                var v = MemoryMarshal.Cast<float, Vector<float>>(f.AsSpan());
+                var vc = new Vector<float>(c);
+                int i = start;
+                for (; i < imax; ++i)
+                {
+                    int vw = fw / VecF, vl = fl / VecF, vo = (fw - NB_ELTS_V8) / VecF;
+                    for (int k = 0; k < VecPerElt; k++)
+                        v[vo + k] = v[vo + k] + ((v[vl + k] + v[vw + k]) * vc);
+                    fl = fw;
+                    fw += 2 * NB_ELTS_V8;
+                }
+                if (m < end)
+                {
+                    Debug.Assert(m + 1 == end);
+                    vc = new Vector<float>(c + c);
+                    int vl = fl / VecF, vo = (fw - NB_ELTS_V8) / VecF;
+                    for (int k = 0; k < VecPerElt; k++)
+                        v[vo + k] = v[vo + k] + (v[vl + k] * vc);
+                }
+                return;
             }
             /* To be adapted if NB_ELTS_V8 changes */
             for (int i = start; i < imax; ++i)
@@ -1346,8 +1325,7 @@ namespace OpenJpeg.Internal
             {
                 return true;
             }
-            ThreadPool.GetAvailableThreads(out num_threads, out _);
-            num_threads = disable_multi_threading ? 1 : Math.Min(Environment.ProcessorCount, num_threads);
+            num_threads = Parallelism.ThreadCount(disable_multi_threading);
 
             h_mem_size = MaxResolution(tr_ar, (int)numres);
             /* overflow check */
@@ -1362,8 +1340,7 @@ namespace OpenJpeg.Internal
             h.mem = new int[h_mem_size];
             v.mem = h.mem;
 
-            using (var reset = new ManualResetEvent(false))
-            {
+                        {
                 while (--numres != 0)
                 {
                     int tiledp = 0;
@@ -1397,10 +1374,7 @@ namespace OpenJpeg.Internal
 
                         uint step_j = (rh / (uint)num_jobs);
                         
-                        reset.Reset();
-                        //Alternativly, we can set this to num_jobs and remove the Interlocked.Increment
-                        //and the Interlocked.Decrement after the for loop
-                        int n_thread_workers = 1;
+                        var jobs = new List<decode_h_job>(num_jobs);
 
                         for (j = 0; j < num_jobs; j++)
                         {
@@ -1412,22 +1386,12 @@ namespace OpenJpeg.Internal
                                 j * step_j, max_j
                             );
 
-                            job.h.mem = new int[h_mem_size];
+                            job.h.mem = ArrayPool<int>.Shared.Rent((int)h_mem_size);
 
-                            Interlocked.Increment(ref n_thread_workers);
-                            ThreadPool.QueueUserWorkItem((x) =>
-                            {
-                                try { decode_h_func((decode_h_job)x); }
-                                finally
-                                {
-                                    if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                                        reset.Set();
-                                }
-                            }, job);
+                            jobs.Add(job);
                         }
-                        if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                            reset.Set();
-                        reset.WaitOne();
+                        Parallelism.RunAll(jobs, decode_h_func);
+                        foreach (var job in jobs) ArrayPool<int>.Shared.Return(job.h.mem);
                     }
 
                     v.dn = (int)(rh - (uint)v.sn);
@@ -1453,8 +1417,7 @@ namespace OpenJpeg.Internal
 
                         uint step_j = (rw / (uint)num_jobs);
 
-                        reset.Reset();
-                        int n_thread_workers = 1;
+                        var jobs = new List<decode_v_job>(num_jobs);
 
                         for (j = 0; j < num_jobs; j++)
                         {
@@ -1465,22 +1428,12 @@ namespace OpenJpeg.Internal
                                 v.Clone(), rh, w, tilec.data, tiledp,
                                 j * step_j, max_j
                             );
-                            job.v.mem = new int[h_mem_size];
+                            job.v.mem = ArrayPool<int>.Shared.Rent((int)h_mem_size);
 
-                            Interlocked.Increment(ref n_thread_workers);
-                            ThreadPool.QueueUserWorkItem((x) =>
-                            {
-                                try { decode_v_func((decode_v_job)x); }
-                                finally
-                                {
-                                    if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                                        reset.Set();
-                                }
-                            }, job);
+                            jobs.Add(job);
                         }
-                        if (Interlocked.Decrement(ref n_thread_workers) == 0)
-                            reset.Set();
-                        reset.WaitOne();
+                        Parallelism.RunAll(jobs, decode_v_func);
+                        foreach (var job in jobs) ArrayPool<int>.Shared.Return(job.v.mem);
                     }
                 }
             }
@@ -2599,7 +2552,7 @@ namespace OpenJpeg.Internal
             var w = (int)job.w;
             var aj_ar = job.aj;
             var aj = job.ajp;
-            IntOrFloat fi = new IntOrFloat();
+            var ajf = MemoryMarshal.Cast<int, float>(aj_ar.AsSpan()); // tile data holds float bits here
 
             for (int j = 0; j + NB_ELTS_V8 <= job.nb_rows; j += NB_ELTS_V8)
             {
@@ -2613,27 +2566,19 @@ namespace OpenJpeg.Internal
                     //floating points. Here it's stored as a continious array. 
                     int k_wavelet = k * NB_ELTS_V8;
 
-                    fi.F = job.h.wavelet[k_wavelet + 0];
-                    aj_ar[aj + k] = fi.I;
-                    fi.F = job.h.wavelet[k_wavelet + 1];
-                    aj_ar[aj + k + w] = fi.I;
-                    fi.F = job.h.wavelet[k_wavelet + 2];
-                    aj_ar[aj + k + w * 2] = fi.I;
-                    fi.F = job.h.wavelet[k_wavelet + 3];
-                    aj_ar[aj + k + w * 3] = fi.I;
+                    ajf[aj + k] = job.h.wavelet[k_wavelet + 0];
+                    ajf[aj + k + w] = job.h.wavelet[k_wavelet + 1];
+                    ajf[aj + k + w * 2] = job.h.wavelet[k_wavelet + 2];
+                    ajf[aj + k + w * 3] = job.h.wavelet[k_wavelet + 3];
                 }
                 for (int k = 0; k < job.rw; k++)
                 {
                     int k_wavelet = k * NB_ELTS_V8;
 
-                    fi.F = job.h.wavelet[k_wavelet + 4];
-                    aj_ar[aj + k + w * 4] = fi.I;
-                    fi.F = job.h.wavelet[k_wavelet + 5];
-                    aj_ar[aj + k + w * 5] = fi.I;
-                    fi.F = job.h.wavelet[k_wavelet + 6];
-                    aj_ar[aj + k + w * 6] = fi.I;
-                    fi.F = job.h.wavelet[k_wavelet + 7];
-                    aj_ar[aj + k + w * 7] = fi.I;
+                    ajf[aj + k + w * 4] = job.h.wavelet[k_wavelet + 4];
+                    ajf[aj + k + w * 5] = job.h.wavelet[k_wavelet + 5];
+                    ajf[aj + k + w * 6] = job.h.wavelet[k_wavelet + 6];
+                    ajf[aj + k + w * 7] = job.h.wavelet[k_wavelet + 7];
                 }
 
                 aj += w * NB_ELTS_V8;
@@ -3071,6 +3016,116 @@ namespace OpenJpeg.Internal
                 idwt53_v(job.v, job.tiled, job.tiledp + j, (int)job.w, (int)(job.max_j - j));
         }
 
+#if NET7_0_OR_GREATER
+        /// <summary>5/3 vertical SIMD path: Vector&lt;int&gt; shifts need .NET 7.</summary>
+        static readonly bool UseVectors53 = Vector.IsHardwareAccelerated && PARALLEL_COLS_53 % Vector<int>.Count == 0;
+
+        /// <summary>
+        /// Vertical inverse 5x3 transform of PARALLEL_COLS_53 columns, top-most pixel on an even coordinate.
+        /// </summary>
+        /// <remarks>
+        /// 2.5.4 - opj_idwt53_v_cas0_mcols_SIMD. Integer only, so identical to idwt3_v_cas0 per column.
+        /// Each Vector&lt;int&gt;-wide group of columns is processed top to bottom in turn.
+        /// </remarks>
+        private static void idwt53_v_cas0_mcols(int[] tmp, int sn, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            var two = new Vector<int>(2);
+            Debug.Assert(len > 1);
+
+            for (int c = 0; c < P; c += V)
+            {
+                int in_even = tiledp_col + c;
+                int in_odd = tiledp_col + c + sn * stride;
+
+                var s1n = new Vector<int>(tiled, in_even);
+                var d1n = new Vector<int>(tiled, in_odd);
+                // s0n = s1n - ((d1n + 1) >> 1) <==> s0n = s1n - ((d1n + d1n + 2) >> 2)
+                var s0n = s1n - ((d1n + d1n + two) >> 2);
+
+                int i = 0, j = 1;
+                for (; i < len - 3; i += 2, j++)
+                {
+                    var d1c = d1n;
+                    var s0c = s0n;
+                    s1n = new Vector<int>(tiled, in_even + j * stride);
+                    d1n = new Vector<int>(tiled, in_odd + j * stride);
+                    s0n = s1n - ((d1c + d1n + two) >> 2);
+                    s0c.CopyTo(tmp, P * i + c);
+                    (d1c + ((s0c + s0n) >> 1)).CopyTo(tmp, P * (i + 1) + c);
+                }
+                s0n.CopyTo(tmp, P * i + c);
+
+                if ((len & 1) != 0)
+                {
+                    s1n = new Vector<int>(tiled, in_even + ((len - 1) / 2) * stride);
+                    var last = s1n - ((d1n + d1n + two) >> 2);
+                    last.CopyTo(tmp, P * (len - 1) + c);
+                    (d1n + ((s0n + last) >> 1)).CopyTo(tmp, P * (len - 2) + c);
+                }
+                else
+                {
+                    (d1n + s0n).CopyTo(tmp, P * (len - 1) + c);
+                }
+            }
+
+            for (int i = 0; i < len; ++i)
+                Array.Copy(tmp, P * i, tiled, tiledp_col + i * stride, P);
+        }
+
+        /// <summary>
+        /// Vertical inverse 5x3 transform of PARALLEL_COLS_53 columns, top-most pixel on an odd coordinate.
+        /// </summary>
+        /// <remarks>2.5.4 - opj_idwt53_v_cas1_mcols_SIMD. Integer only, so identical to idwt3_v_cas1 per column.</remarks>
+        private static void idwt53_v_cas1_mcols(int[] tmp, int sn, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            var two = new Vector<int>(2);
+            Debug.Assert(len > 2);
+
+            for (int c = 0; c < P; c += V)
+            {
+                int in_even = tiledp_col + c + sn * stride;
+                int in_odd = tiledp_col + c;
+
+                var s1 = new Vector<int>(tiled, in_even + stride);
+                var e0 = new Vector<int>(tiled, in_even);
+                // in_odd[0] - ((in_even[0] + s1 + 2) >> 2)
+                var dc = new Vector<int>(tiled, in_odd) - ((e0 + s1 + two) >> 2);
+                (e0 + dc).CopyTo(tmp, c);
+
+                int i = 1, j = 1;
+                int end = len - 2 - ((len & 1) == 0 ? 1 : 0);
+                for (; i < end; i += 2, j++)
+                {
+                    var s2 = new Vector<int>(tiled, in_even + (j + 1) * stride);
+                    var dn = new Vector<int>(tiled, in_odd + j * stride) - ((s1 + s2 + two) >> 2);
+                    dc.CopyTo(tmp, P * i + c);
+                    (s1 + ((dn + dc) >> 1)).CopyTo(tmp, P * (i + 1) + c);
+                    dc = dn;
+                    s1 = s2;
+                }
+                dc.CopyTo(tmp, P * i + c);
+
+                if ((len & 1) == 0)
+                {
+                    var dn = new Vector<int>(tiled, in_odd + (len / 2 - 1) * stride) - ((s1 + s1 + two) >> 2);
+                    (s1 + ((dn + dc) >> 1)).CopyTo(tmp, P * (len - 2) + c);
+                    dn.CopyTo(tmp, P * (len - 1) + c);
+                }
+                else
+                {
+                    (s1 + dc).CopyTo(tmp, P * (len - 1) + c);
+                }
+            }
+
+            for (int i = 0; i < len; ++i)
+                Array.Copy(tmp, P * i, tiled, tiledp_col + i * stride, P);
+        }
+#endif
+
         //2.5
         private static void idwt53_v(dwt_local dwt, int[] tiled, int tiledp_col, int stride, int nb_cols)
         {
@@ -3106,8 +3161,13 @@ namespace OpenJpeg.Internal
             int len = sn + dwt.dn;
             if (dwt.cas == 0)
             {
-                //C# Snip SSE2
-
+#if NET7_0_OR_GREATER
+                if (UseVectors53 && len > 1 && nb_cols == PARALLEL_COLS_53)
+                {
+                    idwt53_v_cas0_mcols(dwt.mem, sn, len, tiled, tiledp_col, stride);
+                    return;
+                }
+#endif
                 if (len > 1)
                 {
                     for (int c = 0; c < nb_cols; c++, tiledp_col++)
@@ -3157,8 +3217,13 @@ namespace OpenJpeg.Internal
                     return;
                 }
 
-                //C# Snip SSE2
-
+#if NET7_0_OR_GREATER
+                if (UseVectors53 && len > 2 && nb_cols == PARALLEL_COLS_53)
+                {
+                    idwt53_v_cas1_mcols(dwt.mem, sn, len, tiled, tiledp_col, stride);
+                    return;
+                }
+#endif
                 if (len > 2)
                 {
                     for (int c = 0; c < nb_cols; c++, tiledp_col++)

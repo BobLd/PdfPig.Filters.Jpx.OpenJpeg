@@ -86,23 +86,31 @@ namespace OpenJpeg.Internal
 
         uint _w;
         uint _h;
-        int datasize
+        // Capacity of the reused buffers. Like t1->datasize/flagssize in C, the arrays only grow.
+        int datasize => _data != null ? _data.Length : 0;
+        int flagssize => flags != null ? flags.Length : 0;
+
+        /// <summary>
+        /// One T1 context per thread, reused across code-blocks like the per-thread opj_t1_t in upstream
+        /// (opj_t1_clbl_decode_processor). Only returned here after a job completes normally.
+        /// </summary>
+        [ThreadStatic] static Tier1Coding t_cached;
+
+        /// <summary>Compressed-data scratch above this size is not kept in the per-thread cache.</summary>
+        const int MaxCachedCblkDataBuffer = 1 << 20;
+
+        static Tier1Coding Rent()
         {
-            get { return _data != null ? _data.Length : 0; }
-            set
-            {
-                if (value != datasize)
-                    throw new NotImplementedException("Datasize different from _data.Length");
-            }
+            var t1 = t_cached ?? new Tier1Coding();
+            t_cached = null;
+            return t1;
         }
-        int flagssize
+
+        static void Return(Tier1Coding t1)
         {
-            get { return flags != null ? flags.Length : 0; }
-            set
-            {
-                if (value != flagssize)
-                    throw new NotImplementedException("Flagsize different from flags.Length");
-            }
+            if (t1.cblkdatabuffer != null && t1.cblkdatabuffer.Length > MaxCachedCblkDataBuffer)
+                t1.cblkdatabuffer = null;
+            t_cached = t1;
         }
 
         //TODO v.2.5: Remove
@@ -1237,6 +1245,13 @@ namespace OpenJpeg.Internal
         /// </remarks>
         internal static void ThreadWorker(T1CBLKEncodeProcessingJob job)
         {
+            var t1 = Rent();
+            EncodeJob(job, t1);
+            Return(t1); // skipped on exception, so a context in a bad state is never reused
+        }
+
+        static void EncodeJob(T1CBLKEncodeProcessingJob job, Tier1Coding t1)
+        {
             var cblk = job.cblk;
             var band = job.band;
             var tilec = job.tilec;
@@ -1250,10 +1265,6 @@ namespace OpenJpeg.Internal
             if (!job.pret)
                 return;
 
-            //C#
-            //It's not recommended to use thread local storage on the
-            //generic threadpool, so we always create this object.
-            var t1 = new Tier1Coding();
 
             if ((band.bandno & 1) != 0)
             {
@@ -1379,6 +1390,13 @@ namespace OpenJpeg.Internal
         /// </remarks>
         internal static void ThreadWorker(T1CBLKDecodeProcessingJob job)
         {
+            var t1 = Rent();
+            DecodeJob(job, t1);
+            Return(t1); // skipped on exception: DecodeCblk may still point _data at the code-block buffer
+        }
+
+        static void DecodeJob(T1CBLKDecodeProcessingJob job, Tier1Coding t1)
+        {
             uint cblk_w, cblk_h;
 
             var cblk = job.cblk;
@@ -1410,16 +1428,6 @@ namespace OpenJpeg.Internal
                 return;
             }
 
-            //C#
-            //It's not recommended to use thread local storage on the
-            //generic threadpool. This because you need to remove the
-            //stored objects to avoid a memory leak... this needs some
-            //thinking
-            var t1 = new Tier1Coding();
-            //Perhaps have a syncronized linked list over threadlocals,
-            //hmm. Can you call threadlocal.remove from antoher thread?
-            //But, I belive there's a low chance I'll see a threadpool
-            //thread again, so this optimalization is probably pointless
 
             t1.mustuse_cblkdatabuffer = job.mustuse_cblkdatabuffer;
 
@@ -5952,16 +5960,10 @@ namespace OpenJpeg.Internal
             {
                 int new_datasize = w * h;
 
-                if (new_datasize > datasize || _data == null)
-                {
+                if (new_datasize > datasize)
                     _data = new int[new_datasize];
-                    datasize = new_datasize;
-                }
                 else
-                {
-                    //Perhaps just make a new array?
-                    Array.Clear(_data, 0, _data.Length);
-                }
+                    Array.Clear(_data, 0, new_datasize);
             }
 
             // We expand these buffers to multiples of 16 bytes.
@@ -5970,15 +5972,10 @@ namespace OpenJpeg.Internal
             int new_flagsize = 132 * /* sizeof(uint) * */ 4;
             new_flagsize += 528 / 4; // 514 expanded to multiples of 16
 
-            if (new_flagsize > flagssize || flags == null)
-            {
+            if (new_flagsize > flagssize)
                 flags = new T1[new_flagsize];
-            }
             else
-            {
                 Array.Clear(flags, 0, new_flagsize);
-            }
-            flagssize = new_flagsize;
 
             _w = (uint)w;
             _h = (uint)h;
@@ -5999,16 +5996,10 @@ namespace OpenJpeg.Internal
             {
                 int new_datasize = w * h;
 
-                if (new_datasize > datasize || _data == null)
-                {
+                if (new_datasize > datasize)
                     _data = new int[new_datasize];
-                    datasize = new_datasize;
-                }
                 else
-                {
-                    //Perhaps just make a new array?
-                    Array.Clear(_data, 0, _data.Length);
-                }
+                    Array.Clear(_data, 0, new_datasize);
             }
 
             int flags_stride = w + 2;
@@ -6019,11 +6010,10 @@ namespace OpenJpeg.Internal
             {
                 int flags_height = (h + 3) / 4;
 
-                if (flagssize > this.flagssize || flags == null)
+                if (flagssize > this.flagssize)
                     flags = new T1[flagssize];
                 else
                     Array.Clear(flags, 0, flagssize);
-                this.flagssize = flagssize;
 
                 for (int x = 0, b = ((flags_height + 1) * flags_stride); x < flags_stride; ++x)
                 {

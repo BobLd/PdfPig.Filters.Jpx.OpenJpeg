@@ -206,6 +206,15 @@ namespace OpenJpeg.Internal
         }
 
         /// <summary>
+        /// Sets the precision after the caller has rescaled <see cref="Data"/> itself.
+        /// </summary>
+        internal void SetPrecision(int new_prec)
+        {
+            prec = (uint)new_prec;
+            bpp = new_prec;
+        }
+
+        /// <summary>
         /// Change the precision of the component
         /// </summary>
         /// <param name="new_prec">New precision</param>

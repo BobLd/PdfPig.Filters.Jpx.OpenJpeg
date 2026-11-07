@@ -364,3 +364,6 @@ FodyWeavers.xsd
 
 
 /.idea/.idea.UglyToad.PdfPig.Filters.Jpx.OpenJpeg/.idea
+
+# Upstream OpenJPEG reference build (tools/reference/build.ps1)
+.reference/

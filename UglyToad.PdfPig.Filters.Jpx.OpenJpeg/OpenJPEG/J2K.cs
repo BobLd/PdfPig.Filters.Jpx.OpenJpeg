@@ -168,8 +168,9 @@ namespace OpenJpeg
             var j2k = new J2K(cinfo);
             if (j2k._is_decompressor)
             {
-                //Default to using strict mode
-                j2k.DecoderSetStrictMode(true);
+                // Default to using strict mode. Set the field directly like opj_j2k_create_decompress:
+                // DecoderSetStrictMode(true) would also disable the TPsot==TNsot correction.
+                j2k._cp.strict = true;
 
                 j2k._cp.IsDecoder = true;
                 // in the absence of JP2 boxes, consider different bit depth / sign
@@ -3743,9 +3744,10 @@ namespace OpenJpeg
                 {
                     if (_cstr_index.tile_index[tile_no_to_dec].n_tps == 0)
                     {
-                        // the index for this tile has not been built,
-                        //  so move to the last SOT read
-                        _cio.Pos = _specific_param.decoder.last_sot_read_pos + 2;
+                        // The index for this tile has not been built (tile-parts interleaved with
+                        // other tiles' and TNsot not yet seen). last_sot_read_pos may point past the
+                        // tile's first tile-part, so restart from the main header end. Upstream #1558.
+                        _cio.Pos = _cstr_index.main_head_end + 2;
                     }
                     else
                     {
@@ -4323,6 +4325,7 @@ namespace OpenJpeg
                 if (_cio.BytesLeft < 2)
                 {
                     // Assume all is OK
+                    _cio.Pos = l_stream_pos_backup;
                     return true;
                 }
 
@@ -4381,6 +4384,12 @@ namespace OpenJpeg
                 }
                 l_tot_len -= 12U;
                 /* look for next SOT marker */
+                if (_cio.BytesLeft < l_tot_len)
+                {
+                    // assume all is OK
+                    _cio.Pos = l_stream_pos_backup;
+                    return true;
+                }
                 _cio.Skip(l_tot_len);
             }
 
@@ -5350,12 +5359,14 @@ namespace OpenJpeg
 
                 OPJ_UINT32 current_tile_part =
                     _cstr_index.tile_index[_current_tile_number].current_tpsno;
-                _cstr_index.tile_index[_current_tile_number].tp_index[current_tile_part].end_header
-                    =
-                        current_pos;
-                _cstr_index.tile_index[_current_tile_number].tp_index[current_tile_part].end_pos
-                    =
-                        current_pos + _specific_param.decoder.sot_length + 2;
+                if (_cstr_index.tile_index[_current_tile_number].tp_index != null &&
+                    current_tile_part < _cstr_index.tile_index[_current_tile_number].n_tps)
+                {
+                    _cstr_index.tile_index[_current_tile_number].tp_index[current_tile_part].end_header
+                        = current_pos;
+                    _cstr_index.tile_index[_current_tile_number].tp_index[current_tile_part].end_pos
+                        = current_pos + _specific_param.decoder.sot_length + 2;
+                }
 
                 AddTlmarker(_current_tile_number, J2K_Marker.SOD, current_pos,
                     _specific_param.decoder.sot_length + 2);
@@ -5811,7 +5822,7 @@ namespace OpenJpeg
                 tcp.ppt_markers = new PPX[count];
                 tcp.ppt_markers_count = (uint)count;
             }
-            else
+            else if (tcp.ppt_markers_count <= Z_ppt)
             {   // NON-first PPT marker
                 int count = Z_ppt + 1;
                 Array.Resize(ref tcp.ppt_markers, count);
@@ -6477,9 +6488,12 @@ namespace OpenJpeg
                 return false;
             }
 
-            for (i = 0; i < _private_image.numcomps; ++i)
+            if (l_nb_stages > 0)
             {
-                l_tcp.tccps[i].dc_level_shift = 0;
+                for (i = 0; i < _private_image.numcomps; ++i)
+                {
+                    l_tcp.tccps[i].dc_level_shift = 0;
+                }
             }
 
             if (l_tcp.mct_decoding_matrix != null)

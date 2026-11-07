@@ -70,7 +70,7 @@ namespace OpenJpeg
         /// alwyas be RGB(A) or GRAY. Where Gray is 1 or 2 components, and
         /// RGB is 3 or 4 components.
         /// </remarks>
-        internal COLOR_SPACE color_space;
+        internal COLOR_SPACE color_space = COLOR_SPACE.UNSPECIFIED;
 
         /// <summary>
         /// C# Added for PdfLib

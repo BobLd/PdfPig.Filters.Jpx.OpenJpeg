@@ -1,5 +1,6 @@
-# UglyToad.PdfPig.Filters.Jpx.OpenJpeg
-PdfPig implementation of the JPX (Jpeg2000) filter, based on [OpenJPEG.net](https://github.com/notBald/OpenJPEG.net)
+﻿# UglyToad.PdfPig.Filters.Jpx.OpenJpeg
+PdfPig implementation of the JPX (Jpeg2000) filter: a fully managed C# port of [OpenJPEG](https://github.com/uclouvain/openjpeg),
+based on [OpenJPEG.net](https://github.com/notBald/OpenJPEG.net). Decoded samples are bit-identical to the C library.
 
 ## Other filters
 - JPX filter alternative approach available here: https://github.com/BobLd/UglyToad.PdfPig.Filters.Jpx.OpenJpegDotNet
@@ -79,3 +80,11 @@ using (var doc = PdfDocument.Open("test.pdf", parsingOption))
 }
 
 ```
+
+## Development
+- `UglyToad.PdfPig.Filters.Jpx.OpenJpeg/OpenJPEG/` holds the port. `UPSTREAM.md` there records the upstream OpenJPEG commit
+  it is synced to, the C to C# file map, and the deliberate differences.
+- `tools/` builds upstream C OpenJPEG and checks that the C# decoder gives the same samples (`tools/README.md`).
+- `UglyToad.PdfPig.Filters.Jpx.OpenJpeg.Benchmarks` measures speed and allocations, including against native OpenJPEG.
+  `benchmarks/compare-versions.ps1 -Baseline <git ref>` compares the working tree with an earlier version.
+- `.claude/skills/` has the procedures for syncing with upstream and for verifying decoder changes.

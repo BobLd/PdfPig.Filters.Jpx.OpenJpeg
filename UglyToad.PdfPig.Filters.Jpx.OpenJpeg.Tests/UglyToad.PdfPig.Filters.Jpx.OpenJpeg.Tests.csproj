@@ -26,6 +26,10 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<None Include="Reference\jpx-reference.tsv" CopyToOutputDirectory="PreserveNewest" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<None Update="Documents\68-1990-01_A.pdf">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</None>

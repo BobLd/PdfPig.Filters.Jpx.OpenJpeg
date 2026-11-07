@@ -967,6 +967,10 @@ namespace OpenJpeg.Internal
             // set values on the first packet iterator
             var current_pi = pi_ar[0];
             current_pi.tp_on = cp.specific_param.enc.tp_on;
+            if (step_l > int.MaxValue / tcp.numlayers)
+            {
+                return null;
+            }
             current_pi.include = new bool[tcp.numlayers * step_l];
 
             // Special treatment for the first packet iterator

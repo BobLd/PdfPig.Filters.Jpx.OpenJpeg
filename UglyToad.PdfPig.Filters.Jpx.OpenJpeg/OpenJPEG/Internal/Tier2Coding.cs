@@ -850,6 +850,11 @@ namespace OpenJpeg.Internal
             uint n_pocs = tcp.numpocs + 1;
 
             PacketIterator[] pi = PacketIterator.InitialiseEncode(_image, _cp, (uint)tileno, t2_mode, _cinfo);
+            if (pi == null)
+            {
+                data_written = 0;
+                return false;
+            }
 
             data_written = 0;
 
