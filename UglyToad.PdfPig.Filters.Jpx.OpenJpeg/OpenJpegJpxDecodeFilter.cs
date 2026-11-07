@@ -110,11 +110,63 @@ namespace UglyToad.PdfPig.Filters.Jpx.OpenJpeg
             }
             // Note, we don't here handle grayscale or CMY format. 
 
+            // PDF 2.0, 8.9.5.1: BitsPerComponent "shall be ignored" for JPXDecode, but PdfPig uses it when present
+            // to read the decoded bytes. If it disagrees with the codestream (e.g. 4-bit JPX with
+            // /BitsPerComponent 8, GHOSTSCRIPT-696255-0.pdf), rescale the samples to the declared depth.
+            if (streamDictionary.TryGet(NameToken.BitsPerComponent, out NumericToken? bpcToken))
+            {
+                int bpc = bpcToken.Int;
+                if (bpc is 1 or 2 or 4 or 8 or 16 && bpc != img.MaxBPC && !MayBeIndexed(streamDictionary))
+                {
+                    ScaleToBitsPerComponent(img, bpc);
+                }
+            }
+
             // Assembles the image into a stream of bytes
             using (var ms = img.ToMemoryStream())
             {
                 return ms.AsMemory();
             }
+        }
+
+        /// <summary>
+        /// Linear full-range rescale (max maps to max), like <see cref="JPXImage.MakeUniformBPC"/>.
+        /// Signed components are left alone: PDF samples are unsigned.
+        /// </summary>
+        private static void ScaleToBitsPerComponent(JPXImage img, int bpc)
+        {
+            foreach (var comp in img.Components)
+            {
+                if (comp.Signed || comp.Prec == bpc || comp.Prec <= 0 || comp.Prec > 30)
+                {
+                    continue;
+                }
+
+                long oldMax = (1L << comp.Prec) - 1, newMax = (1L << bpc) - 1;
+                var data = comp.Data;
+                for (int i = 0; i < data.Length; i++)
+                {
+                    long v = Math.Min(Math.Max(data[i], 0), oldMax);
+                    data[i] = (int)((v * newMax + oldMax / 2) / oldMax);
+                }
+                comp.SetPrecision(bpc);
+            }
+        }
+
+        /// <summary>
+        /// Indexed samples are palette indices, which must never be rescaled. An unresolved reference
+        /// counts as possibly indexed: this filter has no access to the document to look it up.
+        /// </summary>
+        private static bool MayBeIndexed(DictionaryToken streamDictionary)
+        {
+            if (!streamDictionary.TryGet(NameToken.ColorSpace, out var cs) || cs is NameToken)
+            {
+                return false;
+            }
+
+            return cs is not ArrayToken array ||
+                   (array.Data.Count > 0 && array.Data[0] is NameToken name &&
+                    (name.Equals(NameToken.Indexed) || name.Data == "I"));
         }
 
         /// <summary>

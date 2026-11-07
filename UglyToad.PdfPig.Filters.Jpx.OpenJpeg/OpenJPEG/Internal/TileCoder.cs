@@ -33,6 +33,8 @@
 #endregion
 #region Using
 using System;
+using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
@@ -1492,11 +1494,8 @@ namespace OpenJpeg.Internal
         /// </summary>
         /// <remarks>
         /// Org impl depends on its threadpool impl for limiting the number of threads,
-        /// it also takes advantage of threadlocal store.
-        /// 
-        /// Since this impl. depends on .net's threadpool, we have to manualy limit the
-        /// number of executable threads, and local storage isn't reccomended with these
-        /// threads, as we don't own them, so we don't use it.
+        /// it also takes advantage of threadlocal store. Here Parallelism.RunAll limits the
+        /// threads, and Tier1Coding keeps one T1 context per thread.
         /// </remarks>
         /// <param name="create_jobs">Used to generate the jobs that will be scheduled</param>
         /// <param name="run_thread">Command to actually run the job</param>
@@ -1504,13 +1503,7 @@ namespace OpenJpeg.Internal
         private bool RunThreads(CreateJobs create_jobs, ThreadWorker run_thread)
         {
             bool ret = true;
-
-            //How many threads are currently working
-            int running_jobs = 0;
-
-            int max_threads;
-            ThreadPool.GetAvailableThreads(out max_threads, out _);
-            max_threads = _cinfo.DisableMultiThreading ? 1 : Math.Min(Environment.ProcessorCount, max_threads);
+            int max_threads = Parallelism.ThreadCount(_cinfo.DisableMultiThreading);
 
             //Generator for work
             var work = create_jobs(max_threads > 1, (val) =>
@@ -1522,114 +1515,7 @@ namespace OpenJpeg.Internal
                 return ret;
             });
 
-            var reset = new ManualResetEvent(true);
-            var done = new ManualResetEvent(true); //<-- true in case there's no jobs
-            try
-            {
-                foreach (var job in work)
-                {
-                    //Before we enqueue the job, we must wait for a thread to become
-                    //avalible.
-                    int jobs = Interlocked.Increment(ref running_jobs);
-                    if (jobs == max_threads)
-                    {
-                        //When max_threads == 1, we'll always enter this if,
-                        //including on the first itteration.
-
-                        reset.WaitOne();
-                        reset.Reset();
-                    }
-
-                    //max_threads may be == 1, which is why this isn't an "else if"
-                    if (jobs == 1)
-                    {
-                        //Can only be 1 after incrementing from 0, as this thread is
-                        //the only thread incrementing running_jobs.
-                        //
-                        //This means we know that "done" is set, and thus needs
-                        //to be reset.
-                        //
-                        //We lock before we reset so that we're sure that the thread
-                        //which decremented to zero is actually done, as it may be
-                        //sleeping right before "done.Set()"
-                        lock (reset) { done.Reset(); }
-                    }
-
-                    ThreadPool.QueueUserWorkItem((x) =>
-                    {
-                        try { run_thread(x); }
-                        finally
-                        {
-                            // Locking on reset is safe as it's a method local object.
-                            //
-                            //The reason we grab a lock is because we this thread
-                            //may fall asleep right before done.Set().
-                            lock (reset)
-                            {
-                                //Only worker threads decrement running jobs. 
-                                int rj = Interlocked.Decrement(ref running_jobs);
-
-                                //In theory we don't always have to set the reset flag,
-                                //we only need to do so when (running_jobs == max_threads)
-                                //as that means the main thread may be asleep.
-                                //
-                                //However, setting reset doesn't hurt, as we know a slot
-                                //for new work has become avalible. (This thread is finished
-                                //after all), and I'm not 100% sure I'm right in my thinking.
-                                //
-                                //if (running_jobs == max_threads)
-                                {
-
-                                    //Signal the main thread that it can schedule more
-                                    //work.
-                                    reset.Set();
-                                    //The lock( ) isn't needed for reset.Set(), it can be
-                                    //placed after the lock. But again, I'm not 100%
-                                    //sure.
-                                }
-
-                                //rj being zero means this thread decremented running_jobs to
-                                //zero. Since done will only be reset when running_jobs is
-                                //zero, we know that at worst the main thread is waiting to
-                                //call done.reset() right after this thread sets it. 
-                                //
-                                //
-                                //running_jobs being zero means the main thread may be
-                                //waiting on the done signal*.
-                                //
-                                //* It can also be sleeping before the increement, in which
-                                //  case it will reset the done signal after waking up.
-                                //* If it's sleeping after the increement, running_jobs can't
-                                //  be zero.
-                                if (rj == 0 && running_jobs == 0)
-                                {
-                                    done.Set();
-                                }
-                            }
-                        }
-                    }, job);
-
-                    if (jobs == max_threads)
-                    {
-                        //We don't want jobs to become bigger than max_threads, as my logic
-                        //don't like that.
-                        reset.WaitOne();
-                    }
-
-                    //For when we break out of the loop early.
-                    if (!ret)
-                        break;
-                }
-
-                //We have to wait until all threads terminate.
-                done.WaitOne();
-            }
-            finally
-            {
-                done.Dispose();
-                reset.Dispose();
-            }
-
+            Parallelism.RunAll(work, max_threads, job => run_thread(job), () => ret);
             return ret;
         }
 
@@ -1833,6 +1719,49 @@ namespace OpenJpeg.Internal
         }
 
         //2.5.1 - opj_tcd_dc_level_shift_decode
+        /// <summary>
+        /// Vector prefix of the reversible DC level shift row loop: clamp(v + shift, min, max).
+        /// Returns how many samples were done; the caller finishes the row with the scalar loop.
+        /// </summary>
+        static int DcShiftRowInt(Span<int> row, int shift, int min, int max)
+        {
+            if (!Vector.IsHardwareAccelerated) return 0;
+            var v = MemoryMarshal.Cast<int, Vector<int>>(row);
+            var vs = new Vector<int>(shift);
+            var vmin = new Vector<int>(min);
+            var vmax = new Vector<int>(max);
+            for (int k = 0; k < v.Length; k++)
+                v[k] = Vector.Min(Vector.Max(v[k] + vs, vmin), vmax);
+            return v.Length * Vector<int>.Count;
+        }
+
+        /// <summary>
+        /// Vector prefix of the irreversible DC level shift row loop: clamp(round_half_even(f) + shift, min, max),
+        /// where the int array holds float bits. Adding and subtracting 1.5 * 2^23 rounds half-to-even exactly
+        /// for |f| &lt; 2^22, like lrintf/Math.Round. It stops at the first vector with a value outside that
+        /// range (or NaN), leaving the rest to the scalar loop, so results are identical.
+        /// </summary>
+        static int DcShiftRowFloat(Span<int> row, int shift, int min, int max)
+        {
+            if (!Vector.IsHardwareAccelerated) return 0;
+            var vi = MemoryMarshal.Cast<int, Vector<int>>(row);
+            var vf = MemoryMarshal.Cast<int, Vector<float>>(row);
+            var magic = new Vector<float>(12582912f); // 1.5 * 2^23
+            var limit = new Vector<float>(4194304f);  // 2^22
+            var vs = new Vector<int>(shift);
+            var vmin = new Vector<int>(min);
+            var vmax = new Vector<int>(max);
+            int k = 0;
+            for (; k < vf.Length; k++)
+            {
+                var f = vf[k];
+                if (!Vector.LessThanAll(Vector.Abs(f), limit)) break; // also false for NaN
+                var rounded = (f + magic) - magic;
+                vi[k] = Vector.Min(Vector.Max(Vector.ConvertToInt32(rounded) + vs, vmin), vmax);
+            }
+            return k * Vector<int>.Count;
+        }
+
         void DcLevelShiftDecode()
         {
             TcdTile tile = _tcd_image.tiles[0];
@@ -1888,7 +1817,9 @@ namespace OpenJpeg.Internal
                 {
                     for (int j = 0; j < height; j++)
                     {
-                        for (int i = 0; i < width; i++)
+                        int i = DcShiftRowInt(data.AsSpan(data_ptr, width), tccp.dc_level_shift, min, max);
+                        data_ptr += i;
+                        for (; i < width; i++)
                         {
                             data[data_ptr] = MyMath.int_clamp(data[data_ptr] + tccp.dc_level_shift, min, max);
                             data_ptr++;
@@ -1901,7 +1832,9 @@ namespace OpenJpeg.Internal
                     IntOrFloat fi = new IntOrFloat();
                     for (int j = 0; j < height; j++)
                     {
-                        for (int i = 0; i < width; i++)
+                        int i = imagec.prec <= 24 ? DcShiftRowFloat(data.AsSpan(data_ptr, width), tccp.dc_level_shift, min, max) : 0;
+                        data_ptr += i;
+                        for (; i < width; i++)
                         {
                             fi.I = data[data_ptr];
                             if (fi.F > int.MaxValue)

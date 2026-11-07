@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Diagnostics;
 
 namespace OpenJpeg.Internal
@@ -198,7 +200,25 @@ namespace OpenJpeg.Internal
         /// </remarks>
         internal static void Decode(int[] c0, int[] c1, int[] c2, int n)
         {
-            for (int i = 0; i < n; ++i)
+            int i = 0;
+#if NET7_0_OR_GREATER
+            // Vector version of the loop below (upstream has SSE2/AVX2 for this). Integer only: exact.
+            if (Vector.IsHardwareAccelerated)
+            {
+                int V = Vector<int>.Count;
+                for (; i <= n - V; i += V)
+                {
+                    var y = new Vector<int>(c0, i);
+                    var u = new Vector<int>(c1, i);
+                    var v = new Vector<int>(c2, i);
+                    var g = y - ((u + v) >> 2);
+                    (v + g).CopyTo(c0, i);
+                    g.CopyTo(c1, i);
+                    (u + g).CopyTo(c2, i);
+                }
+            }
+#endif
+            for (; i < n; ++i)
             {
                 int y = c0[i];
                 int u = c1[i];
@@ -231,10 +251,34 @@ namespace OpenJpeg.Internal
             IntOrFloat g = new IntOrFloat();
             IntOrFloat b = new IntOrFloat();
 
-            //C# Snip SSE2
+            int i = 0;
+#if !TEST_MATH_MODE
+            // Vector version of the loop below, same operations in the same order, so bit-identical.
+            // The int arrays hold float bits at this stage.
+            if (Vector.IsHardwareAccelerated)
+            {
+                var y0 = MemoryMarshal.Cast<int, Vector<float>>(c0.AsSpan(0, n));
+                var u1 = MemoryMarshal.Cast<int, Vector<float>>(c1.AsSpan(0, n));
+                var v2 = MemoryMarshal.Cast<int, Vector<float>>(c2.AsSpan(0, n));
+                var crv = new Vector<float>(1.402f);
+                var cgu = new Vector<float>(0.34413f);
+                var cgv = new Vector<float>(0.71414f);
+                var cbu = new Vector<float>(1.772f);
+                for (int k = 0; k < y0.Length; k++)
+                {
+                    var vy = y0[k];
+                    var vu = u1[k];
+                    var vv = v2[k];
+                    y0[k] = vy + (vv * crv);
+                    u1[k] = vy - (vu * cgu) - (vv * cgv);
+                    v2[k] = vy + (vu * cbu);
+                }
+                i = y0.Length * Vector<float>.Count;
+            }
+#endif
 
             //C# Liberal application of (float) to reduce math precision to the same as the org. impl
-            for (int i = 0; i < n; ++i)
+            for (; i < n; ++i)
             {
                 y.I = c0[i];
                 u.I = c1[i];

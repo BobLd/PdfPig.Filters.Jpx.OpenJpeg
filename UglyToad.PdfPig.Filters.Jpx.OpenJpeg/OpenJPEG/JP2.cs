@@ -203,6 +203,8 @@ namespace OpenJpeg
             {
                 _meth = 2;
                 _enumcs = 0;
+                if (_color == null) _color = new JP2Color();
+                _color.icc_profile_buf = (byte[])image.icc_profile_buf.Clone();
             }
             else
             {
@@ -353,7 +355,7 @@ namespace OpenJpeg
             var ret = _j2k.ReadHeader(out image);
 
             // Set Image Color Space
-            if (image != null)
+            if (ret && image != null)
             {
                 if (11 <= _enumcs && _enumcs <= 18 && _enumcs != 15)
                     image.color_space = (COLOR_SPACE)_enumcs;
