@@ -44,11 +44,5 @@
 	<ItemGroup>
 		<PackageReference Include="PdfPig" Version="0.1.16" />
 	</ItemGroup>
-
-	<ItemGroup>
-		<Compile Include="..\external\OpenJPEG.net\*.cs" />
-		<Compile Include="..\external\OpenJPEG.net\Internal\*.cs" />
-		<Compile Include="..\external\OpenJPEG.net\Util\*.cs" />
-	</ItemGroup>
-
+			  	
 </Project>
