@@ -32,39 +32,38 @@
 
 using System.Diagnostics;
 
-namespace OpenJpeg
+namespace OpenJpeg;
+
+/// <summary>
+/// Implement this delegate to consume msg events
+/// </summary>
+/// <param name="msg">The message</param>
+/// <param name="client_data">Optional client data</param>
+public delegate void MsgCallback(string msg, object client_data);
+
+public class EventMgr
 {
+    internal readonly MsgCallback _error;
+    internal readonly MsgCallback _warning;
+    internal readonly MsgCallback _info;
+
     /// <summary>
-    /// Implement this delegate to consume msg events
+    /// Constructor
     /// </summary>
-    /// <param name="msg">The message</param>
-    /// <param name="client_data">Optional client data</param>
-    public delegate void MsgCallback(string msg, object client_data);
+    /// <param name="error">Error message callback</param>
+    /// <param name="warn">Warning message callback</param>
+    /// <param name="info">Information message callback</param>
+    public EventMgr(MsgCallback error, MsgCallback warn, MsgCallback info)
+    { _error = error; _warning = warn; _info = info; }
 
-    public class EventMgr
+    /// <summary>
+    /// Open Jpeg clock.
+    /// </summary>
+    /// <remarks>
+    /// Put here for convenience.
+    /// </remarks>
+    internal static double obj_clock()
     {
-        internal readonly MsgCallback _error;
-        internal readonly MsgCallback _warning;
-        internal readonly MsgCallback _info;
-
-        /// <summary>
-        /// Constructor
-        /// </summary>
-        /// <param name="error">Error message callback</param>
-        /// <param name="warn">Warning message callback</param>
-        /// <param name="info">Information message callback</param>
-        public EventMgr(MsgCallback error, MsgCallback warn, MsgCallback info)
-        { _error = error; _warning = warn; _info = info; }
-
-        /// <summary>
-        /// Open Jpeg clock.
-        /// </summary>
-        /// <remarks>
-        /// Put here for convinience. 
-        /// </remarks>
-        internal static double obj_clock()
-        {
-            return Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
-        }
+        return Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
     }
 }
