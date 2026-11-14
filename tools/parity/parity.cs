@@ -1,4 +1,4 @@
-#:project ../../UglyToad.PdfPig.Filters.Jpx.OpenJpeg/UglyToad.PdfPig.Filters.Jpx.OpenJpeg.csproj
+﻿#:project ../../UglyToad.PdfPig.Filters.Jpx.OpenJpeg/UglyToad.PdfPig.Filters.Jpx.OpenJpeg.csproj
 #:property TargetFramework=net8.0
 #:property Optimize=true
 using System.Diagnostics;
@@ -57,7 +57,7 @@ if (args[0] == "hashes")
     var dumper = Path.GetFullPath(args[1]);
     var tmpRef = Path.Combine(Path.GetTempPath(), $"parity_hash_{Environment.ProcessId}.ojd");
     var lines = new SortedSet<string>(StringComparer.Ordinal);
-    foreach (var file in args.Skip(3).SelectMany(d => Directory.EnumerateFiles(d)))
+    foreach (var file in args.Skip(3).SelectMany(d => Directory.EnumerateFiles(d, "*", SearchOption.AllDirectories)))
     {
         File.Delete(tmpRef);
         var proc = Process.Start(new ProcessStartInfo(dumper, $"\"{file}\" \"{tmpRef}\"") { RedirectStandardError = true, RedirectStandardOutput = true })!;
@@ -73,25 +73,29 @@ if (args[0] == "hashes")
 }
 
 // PARITY_THREADS=1 decodes single-threaded (the inline code path); default uses all cores.
+// PARITY_AREA=1 decodes only the centre quarter on both sides (the partial-decoding code paths).
+// PARITY_FORCE_V512=1 forces the Vector512 paths on, software-emulated if the CPU has no AVX-512.
 bool singleThread = Environment.GetEnvironmentVariable("PARITY_THREADS") == "1";
+bool areaMode = Environment.GetEnvironmentVariable("PARITY_AREA") == "1";
+if (Environment.GetEnvironmentVariable("PARITY_FORCE_V512") == "1") AppContext.SetSwitch("OpenJpeg.ForceVector512", true);
 string opjdump = Path.GetFullPath(args[1]);
 var csv = new StreamWriter(args[2]) { AutoFlush = true };
 csv.WriteLine("file,status,detail,c_ms,cs_ms");
 var tmp = Path.Combine(Path.GetTempPath(), $"parity_ref_{Environment.ProcessId}.ojd");
 int ok = 0, total = 0, bad = 0;
-foreach (var file in args.Skip(3).SelectMany(d => Directory.EnumerateFiles(d)).Where(f => !f.EndsWith(".txt") && !f.EndsWith("COPYRIGHT")))
+foreach (var file in args.Skip(3).SelectMany(d => Directory.EnumerateFiles(d, "*", SearchOption.AllDirectories)).Where(f => !f.EndsWith(".txt") && !f.EndsWith("COPYRIGHT")))
 {
     total++;
     File.Delete(tmp);
     var sw = Stopwatch.StartNew();
-    var p = Process.Start(new ProcessStartInfo(opjdump, $"\"{file}\" \"{tmp}\"") { RedirectStandardError = true, RedirectStandardOutput = true })!;
+    var p = Process.Start(new ProcessStartInfo(opjdump, $"\"{file}\" \"{tmp}\"" + (areaMode ? " 0 area" : "")) { RedirectStandardError = true, RedirectStandardOutput = true })!;
     bool cDone = p.WaitForExit(60000); if (!cDone) p.Kill();
     long cMs = sw.ElapsedMilliseconds;
     if (cDone && p.ExitCode == 3) { csv.WriteLine($"{Path.GetFileName(file)},SKIP_HUGE,,{cMs},"); Console.WriteLine($"SKIP_HUGE      {Path.GetFileName(file)}"); ok++; continue; }
     bool cOk = cDone && p.ExitCode == 0 && File.Exists(tmp);
 
     sw.Restart();
-    JPXImage? img = null; string? err = null;
+    JPXImage? img = null; string? err = null; Exception? exc = null;
     var t = Task.Run(() =>
     {
         try
@@ -102,9 +106,9 @@ foreach (var file in args.Skip(3).SelectMany(d => Directory.EnumerateFiles(d)).W
             using var ms = new MemoryStream(bytes, false);
             var cio = ci.OpenCIO(ms, true);
             ci.SetupDecoder(cio, new DecompressionParameters { DisableMultiThreading = singleThread });
-            if (!ci.ReadHeader(out var im) || !ci.Decode(im) || !ci.EndDecompress()) err = "decode=false"; else img = im;
+            if (!ci.ReadHeader(out var im) || (areaMode && !SetCentreQuarter(ci, im)) || !ci.Decode(im) || !ci.EndDecompress()) err = "decode=false"; else img = im;
         }
-        catch (Exception e) { err = e.GetType().Name + ": " + e.Message.Split('\n')[0].Replace(',', ';'); }
+        catch (Exception e) { exc = e; err = e.GetType().Name + ": " + e.Message.Split('\n')[0].Replace(',', ';'); }
     });
     if (!t.Wait(60000)) err = "TIMEOUT";
     long csMs = sw.ElapsedMilliseconds;
@@ -112,7 +116,7 @@ foreach (var file in args.Skip(3).SelectMany(d => Directory.EnumerateFiles(d)).W
     string status, detail = "";
     if (!cOk && img == null) status = "BOTH_FAIL";
     else if (!cOk) status = "C_FAIL_CS_OK";
-    else if (img == null) { status = "CS_FAIL"; detail = err ?? ""; }
+    else if (img == null) { status = "CS_FAIL"; detail = err ?? ""; if (exc != null) Console.Error.WriteLine($"{Path.GetFileName(file)}: {exc}"); }
     else try { (status, detail) = Compare(File.ReadAllBytes(tmp), img); } catch (Exception e) { status = "MISMATCH"; detail = "compare " + e.GetType().Name; }
     if (status is "MATCH" or "BOTH_FAIL") ok++;
     if (status is "MISMATCH" or "CS_FAIL") bad++;
@@ -186,4 +190,16 @@ static partial class Program
         (dict.TryGet(NameToken.Filter, out NameToken name) && name.Data == "JPXDecode") ||
         (dict.TryGet(NameToken.Filter, out ArrayToken array) && array.Data.Count == 1 &&
          array.Data[0] is NameToken only && only.Data == "JPXDecode");
+}
+
+static partial class Program
+{
+    /// <summary>Same area as opjdump's "area" mode: the centre quarter, in image coordinates.</summary>
+    internal static bool SetCentreQuarter(CompressionInfo ci, JPXImage im)
+    {
+        var f = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        uint x0 = (uint)typeof(JPXImage).GetField("x0", f)!.GetValue(im)!, y0 = (uint)typeof(JPXImage).GetField("y0", f)!.GetValue(im)!;
+        uint w = (uint)im.Width, h = (uint)im.Height;
+        return ci.SetDecodeArea(im, (int)(x0 + w / 4), (int)(y0 + h / 4), (int)(x0 + w / 4 + w / 2), (int)(y0 + h / 4 + h / 2));
+    }
 }

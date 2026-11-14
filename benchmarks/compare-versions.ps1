@@ -8,18 +8,22 @@
 .EXAMPLE
   ./benchmarks/compare-versions.ps1 -Baseline master
   ./benchmarks/compare-versions.ps1 -Baseline v0.1.16.1 -Filter '*DecodeBenchmarks*' -Job short
+  ./benchmarks/compare-versions.ps1 -Baseline master -Runtime nativeaot8.0   # NativeAOT: no JIT tiering or dynamic PGO
 #>
 param(
     [Parameter(Mandatory)] [string]$Baseline,
     [string]$Filter = '*DecodeBenchmarks*',
     [string]$Job = 'short',
     [string]$Framework = 'net8.0',
+    # A BenchmarkDotNet runtime moniker such as nativeaot8.0 or net10.0. Default: the -Framework JIT runtime.
+    [string]$Runtime,
     [double]$Threshold = 5
 )
 $ErrorActionPreference = 'Stop'
 $root = Resolve-Path (Join-Path $PSScriptRoot '..')
 $bench = 'UglyToad.PdfPig.Filters.Jpx.OpenJpeg.Benchmarks'
-$out = Join-Path $root '.reference/bench'
+$out = Join-Path $root ('.reference/bench' + ($Runtime ? "-$Runtime" : ''))
+$runtimeArgs = $Runtime ? @('--runtimes', $Runtime) : @()
 # Outside the repo: BenchmarkDotNet finds the project by name under the repo root and rejects duplicates.
 $worktree = Join-Path ([System.IO.Path]::GetTempPath()) 'pdfpig-jpx-bench-baseline'
 
@@ -39,7 +43,7 @@ try {
         # BenchmarkDotNet locates the project from the working directory, so run from that checkout.
         Push-Location $run.Dir
         try {
-            dotnet run -c Release --project (Join-Path $run.Dir $bench) -f $Framework -- --filter $Filter --job $Job --artifacts $artifacts
+            dotnet run -c Release --project (Join-Path $run.Dir $bench) -f $Framework -- --filter $Filter --job $Job --artifacts $artifacts @runtimeArgs
             if ($LASTEXITCODE) { throw "Benchmark run failed for $($run.Name)" }
         }
         finally { Pop-Location }

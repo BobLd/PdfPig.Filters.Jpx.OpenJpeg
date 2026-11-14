@@ -15,8 +15,6 @@ namespace OpenJpeg
     /// <remarks>opj_cparameters</remarks>
     public class CompressionParameters
     {
-        #region Variables and properties
-
         public int NumberOfResolutions
         {
             get { return this.numresolution; }
@@ -325,8 +323,6 @@ namespace OpenJpeg
             }
         }
 
-        #region JPEG 2000 profile macros
-
         public J2K_PROFILE Profile
         {
             get { return rsiz; }
@@ -369,8 +365,6 @@ namespace OpenJpeg
         {
             get { return (rsiz & J2K_PROFILE.PART2) == J2K_PROFILE.PART2; }
         }
-
-        #endregion
 
         /// <summary>
         /// Stores IS 8859-15:1999 (Latin) values
@@ -709,10 +703,6 @@ namespace OpenJpeg
 
         public bool DisableMultiThreading { get; set; }
 
-        #endregion
-
-        #region Init
-
         /// <summary>
         /// Sets up coding parameters by copying from an existing CodingParameters object.
         /// In the original implementation there are two sepperate CodingParameter objects,
@@ -792,8 +782,6 @@ namespace OpenJpeg
             /* jpip_on = false */ //<-- Not supported
         }
 
-        #endregion
-
         /// <summary>
         /// Extract IMF profile without mainlevel/sublevel
         /// </summary>
@@ -839,15 +827,11 @@ namespace OpenJpeg
 
     internal class CodingParameters
     {
-        #region C# impl
-
         /// <summary>
         /// C# Used for buffer size estimation
         /// </summary>
         public int img_size;
         public TileSize TileSize;
-
-        #region JPEG 2000 profile macros
 
         public bool IsCinema
         {
@@ -873,10 +857,6 @@ namespace OpenJpeg
         {
             get { return (rsiz & J2K_PROFILE.PART2) == J2K_PROFILE.PART2; }
         }
-
-        #endregion
-
-        #endregion
 
         public J2K_PROFILE rsiz;
 

@@ -11,8 +11,6 @@ namespace OpenJpeg.Internal
     /// <remarks>opj_tcp_t</remarks>
     internal class TileCodingParams : ICloneable
     {
-        #region Variables and properties
-
         /// <summary>
         /// 1 : first part-tile of a tile
         /// </summary>
@@ -197,20 +195,11 @@ namespace OpenJpeg.Internal
             set { bitvector1 = value ? 4u | bitvector1 : ~4u & bitvector1; }
         }
 
-
-        #endregion
-
-        #region Init
-
         internal TileCodingParams()
         {
             for (int c = 0; c < pocs.Length; c++)
                 pocs[c] = new ProgOrdChang();
         }
-
-        #endregion
-
-        #region ICloneable
 
         public object Clone()
         {
@@ -227,7 +216,5 @@ namespace OpenJpeg.Internal
             tcp.distoratio = (float[]) distoratio.Clone();
             return tcp;
         }
-
-        #endregion
     }
 }

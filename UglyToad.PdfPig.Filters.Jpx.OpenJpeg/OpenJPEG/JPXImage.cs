@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,7 +29,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System;
 using System.Diagnostics;
 using System.Text;
@@ -50,8 +49,6 @@ namespace OpenJpeg
     /// </summary>
     public class JPXImage
     {
-        #region Variables and properties
-
         /// <summary>
         /// Dimensions
         /// </summary>
@@ -313,10 +310,6 @@ namespace OpenJpeg
         /// </summary>
         public COLOR_SPACE GetColorSpace() { return color_space; }
 
-        #endregion
-
-        #region Init
-
         //2.5
         internal JPXImage() { }
 
@@ -330,8 +323,6 @@ namespace OpenJpeg
             this.color_space = cs;
             numcomps = (uint)comps.Length;
         }
-
-        #endregion
 
         /// <summary>
         /// Added for PdfLib
@@ -593,16 +584,10 @@ namespace OpenJpeg
                 Y = 1.0F - Y;
                 K = 1.0F - K;
 
-#if TEST_MATH_MODE
-                comps[0].data[i] = (int)(float)((float)(255.0F * C) * K); // R
-                comps[1].data[i] = (int)(float)((float)(255.0F * M) * K); // G
-                comps[2].data[i] = (int)(float)((float)(255.0F * Y) * K); // B
-#else
                 // CMYK -> RGB : RGB results from 0 to 255
                 comps[0].data[i] = (int)(255.0F * C * K); // R
                 comps[1].data[i] = (int)(255.0F * M * K); // G
                 comps[2].data[i] = (int)(255.0F * Y * K); // B
-#endif
             }
 
             Array.Resize(ref comps, 3);
@@ -661,11 +646,7 @@ namespace OpenJpeg
                 if (!sign2)
                     cr -= flip_value;
 
-#if TEST_MATH_MODE
-                int val = (int)(float)((float)((float)(y - (float)(0.0000368f * cb)) + (float)(1.40199f * cr)) + 0.5f);
-#else
                 int val = (int)(y - 0.0000368f * cb + 1.40199f * cr + 0.5f);
-#endif
 
                 if (val > max_value)
                     val = max_value;
@@ -673,12 +654,7 @@ namespace OpenJpeg
                     val = 0;
                 comps[0].data[i] = val;
 
-#if TEST_MATH_MODE
-                //Should probably have another (float)( ) before the +0.5f
-                val = (int)((float)((float)(1.0003f * y) - (float)(0.344125f * cb)) - (float)(0.7141128f * cr) + 0.5f);
-#else
                 val = (int)(1.0003f * y - 0.344125f * cb - 0.7141128f * cr + 0.5f);
-#endif
 
                 if (val > max_value)
                     val = max_value;
@@ -686,12 +662,7 @@ namespace OpenJpeg
                     val = 0;
                 comps[1].data[i] = val;
 
-#if TEST_MATH_MODE
-                //Should probably have another (float)( ) before the +0.5f
-                val = (int)((float)((float)(0.999823f * y) + (float)(1.77204 * cb)) - (float)(0.000008 * cr) + 0.5f);
-#else
                 val = (int)(0.999823f * y + 1.77204 * cb - 0.000008 * cr + 0.5f);
-#endif
 
                 if (val > max_value)
                     val = max_value;
@@ -1588,13 +1559,8 @@ namespace OpenJpeg
         {
             public readonly BinaryWriter s;
 
-#if NET45
-            //For .NET 4.5 and up
-            public BWrite(Stream s) { this.s = new BinaryWriter(s, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true), true); }
-#else
             //For .NET 4.0
             public BWrite(Stream s) { this.s = new BinaryWriter(s, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)); }
-#endif
             public void Write(string str)
             {
                 s.Write(ASCIIEncoding.ASCII.GetBytes(str));

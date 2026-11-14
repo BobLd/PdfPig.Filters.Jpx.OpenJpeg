@@ -34,8 +34,6 @@ namespace OpenJpeg.Internal
     /// </remarks>
     internal sealed class DecMstabent
     {
-        #region Variables and properties
-
         readonly J2kMarker[] _marks;
 
         internal J2kMarker this[J2K_Marker mark]
@@ -51,10 +49,6 @@ namespace OpenJpeg.Internal
                 return _marks[_marks.Length - 1];
             }
         }
-
-        #endregion
-
-        #region Init
 
         /// <summary>
         /// Constructor
@@ -91,8 +85,6 @@ namespace OpenJpeg.Internal
                 new J2kMarker(J2K_Marker.NONE, J2K_STATUS.MH | J2K_STATUS.TPH, (b) => true)
             };
         }
-
-        #endregion
     }
 
     [DebuggerDisplay("{Mark}")]

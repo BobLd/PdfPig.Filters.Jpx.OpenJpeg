@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,7 +29,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System;
 
 namespace OpenJpeg.Internal
@@ -40,8 +39,6 @@ namespace OpenJpeg.Internal
     /// </summary>
     public class ProgOrdChang : ICloneable
     {
-        #region Variables and properties
-
         /// <summary>
         /// Resolution num start, Component num start, given by POC
         /// </summary>
@@ -106,20 +103,10 @@ namespace OpenJpeg.Internal
         /// </summary>
 	    internal uint lay_t, res_t, comp_t, prc_t,tx0_t,ty0_t;
 
-        #endregion
-
-        #region Init
-
-        #endregion
-
-        #region ICloneable
-
         public object Clone()
         {
             var poc = (ProgOrdChang) MemberwiseClone();
             return poc;
         }
-
-        #endregion
     }
 }

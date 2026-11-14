@@ -1,11 +1,10 @@
-﻿#region License
-/*
+﻿/*
  * Based on PdfLib.BitStream.cs
  * 
  * This class is contributed to the Public Domain.
  * Use it at your own risk.
  */
-#endregion
+
 using System.IO;
 
 namespace OpenJpeg.Internal
@@ -19,8 +18,6 @@ namespace OpenJpeg.Internal
     /// </remarks>
     internal class BIO
     {
-        #region Variables and properties
-
         /// <summary>
         /// The data
         /// </summary>
@@ -54,10 +51,6 @@ namespace OpenJpeg.Internal
 
         internal int Position { get { return _data_pos - _start_pos; } }
 
-        #endregion
-
-        #region Init
-
         /// <summary>
         /// Constructor
         /// </summary>
@@ -70,8 +63,6 @@ namespace OpenJpeg.Internal
             _start_pos = start_pos;
             _end_pos = end_pos;
         }
-
-        #endregion
 
         ///// <summary>
         ///// Can read up to 32 bits out of the bitstream.

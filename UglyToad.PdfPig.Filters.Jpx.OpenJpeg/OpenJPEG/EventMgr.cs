@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,7 +29,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System.Diagnostics;
 
 namespace OpenJpeg
@@ -44,15 +43,9 @@ namespace OpenJpeg
 
     public class EventMgr
     {
-        #region Variables and properties
-
         internal readonly MsgCallback _error;
         internal readonly MsgCallback _warning;
         internal readonly MsgCallback _info;
-
-        #endregion
-
-        #region Init
 
         /// <summary>
         /// Constructor
@@ -62,8 +55,6 @@ namespace OpenJpeg
         /// <param name="info">Information message callback</param>
         public EventMgr(MsgCallback error, MsgCallback warn, MsgCallback info)
         { _error = error; _warning = warn; _info = info; }
-
-        #endregion
 
         /// <summary>
         /// Open Jpeg clock.

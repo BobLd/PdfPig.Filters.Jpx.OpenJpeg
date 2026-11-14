@@ -1,4 +1,5 @@
-/* Dumps decoded component samples (after lib-level pclr/cdef) as: "OJD1", ncomps, colorspace,
+﻿/* Usage: opjdump in out [reduce] [area]
+   Dumps decoded component samples (after lib-level pclr/cdef) as: "OJD1", ncomps, colorspace,
    then per comp: w h dx dy x0 y0 prec sgnd (int32 LE), then w*h int32 samples.
    Exit 1 on decode failure, 3 if the dump would exceed 1 GB (not written, to protect the disk). */
 #include <stdio.h>
@@ -15,9 +16,16 @@ int main(int argc, char **argv) {
     opj_set_error_handler(c, quiet, NULL); opj_set_warning_handler(c, quiet, NULL); opj_set_info_handler(c, quiet, NULL);
     opj_dparameters_t p; opj_set_default_decoder_parameters(&p);
     if (argc > 3) p.cp_reduce = atoi(argv[3]);
+    int area = argc > 4 && strcmp(argv[4], "area") == 0; /* decode the centre quarter: exercises partial decoding */
     opj_stream_t *s = opj_stream_create_default_file_stream(argv[1], OPJ_TRUE);
     opj_image_t *img = NULL;
-    if (!opj_setup_decoder(c, &p) || !opj_read_header(s, c, &img) || !opj_decode(c, s, img) || !opj_end_decompress(c, s)) return 1;
+    if (!opj_setup_decoder(c, &p) || !opj_read_header(s, c, &img)) return 1;
+    if (area) {
+        OPJ_UINT32 w = img->x1 - img->x0, h = img->y1 - img->y0;
+        if (!opj_set_decode_area(c, img, (OPJ_INT32)(img->x0 + w / 4), (OPJ_INT32)(img->y0 + h / 4),
+                                 (OPJ_INT32)(img->x0 + w / 4 + w / 2), (OPJ_INT32)(img->y0 + h / 4 + h / 2))) return 1;
+    }
+    if (!opj_decode(c, s, img) || !opj_end_decompress(c, s)) return 1;
     unsigned long long total = 0;
     for (OPJ_UINT32 i = 0; i < img->numcomps; i++) total += (unsigned long long)img->comps[i].w * img->comps[i].h;
     if (total * 4 > (1ULL << 30)) return 3;

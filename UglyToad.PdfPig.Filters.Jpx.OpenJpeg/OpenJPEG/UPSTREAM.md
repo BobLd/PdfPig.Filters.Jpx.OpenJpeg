@@ -1,4 +1,4 @@
-# Upstream tracking
+﻿# Upstream tracking
 
 This folder is a C# port of the OpenJPEG `openjp2` library: https://github.com/uclouvain/openjpeg
 It started as a copy of https://github.com/notBald/OpenJPEG.net (via the BobLd fork) and is now maintained here.
@@ -50,6 +50,9 @@ version it was last checked against and the C function name. Search for the C na
   come back to the caller. `DecompressionParameters.DisableMultiThreading` runs everything inline.
 - T1 contexts are cached per thread (`Tier1Coding.Rent/Return`), like upstream's per-thread `opj_t1_t`.
   DWT job buffers come from `ArrayPool`.
+- Upstream's compile-time variants that its default build leaves out are not ported: `TWO_PASS_VERSION` and
+  `STANDARD_SLOW_VERSION` (DWT, documentation only), `ENABLE_EMPTY_PACKET_OPTIMIZATION` (T2 encoder) and the
+  `dump_state` of `opj_dump` (`DUMP_FLAG` has no effect). When syncing, skip changes inside those blocks.
 
 ## SIMD
 
@@ -64,8 +67,16 @@ Upstream's own SIMD build gives the same samples as its scalar build, and `tools
 | `opj_mct_decode` SSE2/AVX2 (RCT) | `MCT.Decode` | .NET 7+ |
 | `opj_mct_decode_real` SSE (ICT) | `MCT.DecodeReal` | all |
 | `opj_tcd_dc_level_shift_decode` | `TileCoder.DcShiftRowInt/Float` (upstream is scalar) | all |
+| `opj_idwt53_h_cas0` AVX2 / AVX-512 | `DWT.idwt53_h_cas0_avx2` / `_512` | .NET 8, AVX2 / 512-bit |
+| `opj_idwt53_v_*_mcols_SIMD` AVX-512 | `DWT.idwt53_v_cas0/1_mcols512` | .NET 8, 512-bit |
+| `opj_t1_clbl_decode_processor` SSE2/AVX2/AVX-512 | `Tier1Coding.HalveSamples` / `ScaleSamplesToFloatBits` | all (5/3: .NET 7+) |
+| `opj_dwt_decode_partial_1_parallel` SSE2 | `DWT.decode_partial_1_parallel` (`Vector128`) | .NET 7+ |
+| `ht_dec.c` popcount / clz builtins | `ht_dec.population_count` / `count_leading_zeros` (`BitOperations`) | .NET Core 3+ |
 
-Not vectorised yet: the 5/3 horizontal pass (scalar upstream too), encoder paths, partial-tile decoding.
+`Simd.Use512` selects the 512-bit paths. The AppContext switch `OpenJpeg.ForceVector512` (or `PARITY_FORCE_V512=1` in
+`tools/parity`) turns them on without AVX-512 hardware, where .NET emulates them, so they can be verified anywhere.
+
+Not vectorised yet: encoder paths. Beyond upstream: AVX 8x8 transposes in the 9/7 horizontal pass (x86 only).
 Never use fused multiply-add here: it changes rounding.
 
 ## Upstream changes ported after 2.5.3
@@ -88,3 +99,5 @@ Never use fused multiply-add here: it changes rounding.
 - Thread-pool work items had no exception handling: an exception while decoding a corrupt file on a worker
   thread terminated the host process.
 - `DisableMultiThreading` still sent every code-block to the thread pool and waited on an event per job.
+- `SparseArrayInt32.read` (float overload, strided path) converted sample values from int to float instead of copying
+  their bits, so decoding a sub-area (`SetDecodeArea`) of a 9/7 image gave garbage. Found with `PARITY_AREA=1`.

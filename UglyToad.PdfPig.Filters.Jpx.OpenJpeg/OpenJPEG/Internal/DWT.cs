@@ -1,8 +1,4 @@
-﻿using System.Buffers;
-using System.Numerics;
-using System.Runtime.InteropServices;
-#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -32,12 +28,19 @@ using System.Runtime.InteropServices;
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
-//STANDARD_SLOW_VERSION Uses the OpenJpeg 2.1 codepath for DWT decoding.
-//#define STANDARD_SLOW_VERSION
+
+
 using System;
+using System.Buffers;
 using System.Diagnostics;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
+#if NET8_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace OpenJpeg.Internal
 {
@@ -54,9 +57,6 @@ namespace OpenJpeg.Internal
     /// </remarks>
     internal static class DWT
     {
-
-        #region Consts
-
         const float K = 1.230174105f;
         const float invK = (float)(1.0 / 1.230174105);
         const float c13318 = 1.625732422f; //<-- two_invK
@@ -97,8 +97,6 @@ namespace OpenJpeg.Internal
 	        new double[] {1.038, 1.592, 2.919, 5.703, 11.33, 22.64, 45.25, 90.48, 180.9},
 	        new double[] {.7186, .9218, 1.586, 3.043, 6.019, 12.01, 24.00, 47.97, 95.93}
         };
-
-        #endregion
 
         delegate void Encodefunc(int[] a, int dn, int sn, int cas);
         delegate void EncodeAndDeinterleaveVfunc(int[] a, int a_pt, int[] tmp, uint height, bool even, uint stride_width, uint cols);
@@ -611,6 +609,12 @@ namespace OpenJpeg.Internal
         /// Inverse 9-7 wavelet transform in 2-D.
         /// </summary>
         /// <remarks>2.5.1 - opj_dwt_decode_tile</remarks>
+        // The 9/7 DWT methods marked "see decode_tile_97" are fully optimised from the first call. Called once per
+        // tile or per 8 rows, they otherwise run as tier-0 or OSR code for most of a first decode: four 9/7 samples,
+        // one decode per process, DWT 280 -> 83 ms; warm unchanged. Plain vector loops, nothing for dynamic PGO.
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
         internal static bool decode_tile_97(TcdTilecomp tilec, uint numres, bool disable_multi_threading)
         {
             v4dwt_local h = new v4dwt_local();
@@ -673,54 +677,22 @@ namespace OpenJpeg.Internal
                     h.win_h_x0 = 0;
                     h.win_h_x1 = (uint)h.dn;
 
-                    //C# impl. note
-                    //Used to convert from float to the "int value" of the
-                    //float. This is since the org impl. use a int array
-                    //to store both float and int values
-                    var fi = new IntOrFloat();
 
-                    if (num_threads <= 1 || rh < 2 * NB_ELTS_V8)
+                    int num_jobs = DwtJobCount(num_threads, rh / NB_ELTS_V8, (ulong)rw * rh);
+                    if (num_jobs <= 1)
                     {
                         for (j = 0; j + (NB_ELTS_V8 - 1) < rh; j += NB_ELTS_V8)
                         {
                             v8dwt_interleave_h(h, aj_ar, aj, w, NB_ELTS_V8);
                             v8dwt_decode(h);
 
-                            //Copies that back into the aj array.
-                            // C# I'm unsure why it's split into two loops, that is probably an
-                            // optimalization.
-                            for (int k = 0; k < rw; k++)
-                            {
-                                //C# note: Org. impl stores the wavlet as a struct with eight
-                                //floating points. Here it's stored as a continuous array, this
-                                //is why we have to multiply k with 8. 
-                                int k_wavelet = k * NB_ELTS_V8;
-                                ajf[aj + k] = h.wavelet[k_wavelet + 0];
-                                ajf[aj + k + w] = h.wavelet[k_wavelet + 1];
-                                ajf[aj + k + w * 2] = h.wavelet[k_wavelet + 2];
-                                ajf[aj + k + w * 3] = h.wavelet[k_wavelet + 3];
-                            }
-                            for (int k = 0; k < rw; k++)
-                            {
-                                int k_wavelet = k * NB_ELTS_V8;
-                                ajf[aj + k + w * 4] = h.wavelet[k_wavelet + 4];
-                                ajf[aj + k + w * 5] = h.wavelet[k_wavelet + 5];
-                                ajf[aj + k + w * 6] = h.wavelet[k_wavelet + 6];
-                                ajf[aj + k + w * 7] = h.wavelet[k_wavelet + 7];
-                            }
+                            WriteBackRows8(h.wavelet, ajf, aj, w, (int)rw);
 
                             aj += w * NB_ELTS_V8;
                         }
                     }
                     else
                     {
-                        int num_jobs = num_threads;
-
-                        if ((rh / NB_ELTS_V8) < num_jobs)
-                        {
-                            num_jobs = (int)rh / NB_ELTS_V8;
-                        }
-
                         uint step_j = ((rh / (uint)num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
 
                         var jobs = new List<dwt97_decode_h_job>(num_jobs);
@@ -766,22 +738,11 @@ namespace OpenJpeg.Internal
                     v.win_h_x1 = (uint)v.dn;
 
                     aj = 0;
-                    if (num_threads <= 1 || rw < 2 * NB_ELTS_V8)
+                    // Scaling is poor (see below): at most half the threads.
+                    num_jobs = DwtJobCount(Math.Max(num_threads / 2, num_threads > 1 ? 2 : 0), rw / NB_ELTS_V8, (ulong)rw * rh);
+                    if (num_jobs <= 1)
                     {
-                        for (j = (int)rw; j > (NB_ELTS_V8 - 1); j -= NB_ELTS_V8)
-                        {
-                            IntOrFloat faa;
-                            faa.I = 0;
-
-                            v8dwt_interleave_v(v, aj_ar, aj, w, NB_ELTS_V8);
-                            v8dwt_decode(v);
-                            for (int k = 0; k < rh; ++k)
-                            {
-                                Buffer.BlockCopy(v.wavelet, k * NB_ELTS_V8 * sizeof(float), aj_ar, (aj + (k * w)) * sizeof(float), NB_ELTS_V8 * sizeof(float));
-                            }
-
-                            aj += NB_ELTS_V8;
-                        }
+                        aj += VerticalStrips97(v, aj_ar, aj, w, (int)rh, (int)(rw & ~(uint)(NB_ELTS_V8 - 1)));
                     }
                     else
                     {
@@ -790,14 +751,6 @@ namespace OpenJpeg.Internal
                             threads.
                             C# note: I've not run this benchmark
                          */
-                        int num_jobs = Math.Max(num_threads / 2, 2);
-                        //num_jobs = 1;
-
-                        if ((rw / NB_ELTS_V8) < num_jobs)
-                        {
-                            num_jobs = (int)rw / NB_ELTS_V8;
-                        }
-
                         uint step_j = ((rw / (uint)num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
 
                         var jobs = new List<dwt97_decode_v_job>(num_jobs);
@@ -862,6 +815,9 @@ namespace OpenJpeg.Internal
         /// <remarks>
         /// 2.5
         /// </remarks>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
         private static void v8dwt_decode(v4dwt_local dwt)
         {
             /* BUG_WEIRD_TWO_INVK (look for this identifier in tcd.c) */
@@ -889,7 +845,7 @@ namespace OpenJpeg.Internal
                 b = 0;
             }
 
-            //C# Snip SSE code
+            // SIMD (upstream opj_v8dwt_decode_step1/2_sse/avx) is in v8dwt_decode_step1/2, via Vector<float>.
 
             //C# Both a and b index dwt.wavelet, hench why we have to mul with NB_ELTS_V8
             v8dwt_decode_step1(dwt.wavelet, a * NB_ELTS_V8, (int)dwt.win_l_x0, (int)dwt.win_l_x1, K);
@@ -914,6 +870,9 @@ namespace OpenJpeg.Internal
         /// <param name="start">Position of the wavelet in the array</param>
         /// <param name="end">Wavelet count</param>
         /// <param name="c">Some constant</param>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
         private static void v8dwt_decode_step1(float[] f, int fw, int start, int end, float c)
         {
             if (UseVectors)
@@ -922,9 +881,37 @@ namespace OpenJpeg.Internal
                 // per lane as the scalar code, so the result is bit-identical (like upstream's SSE/AVX path).
                 var v = MemoryMarshal.Cast<float, Vector<float>>(f.AsSpan());
                 var vc = new Vector<float>(c);
-                for (int i = start; i < end; ++i)
+                // Vector indices, stepped directly: offsets are non-negative multiples of NB_ELTS_V8.
+                int e = (int)((uint)fw / (uint)VecF) + start * 2 * VecPerElt;
+                int n = end - start;
+                if (n <= 0)
+                    return;
+#if !NETSTANDARD2_1 // no Unsafe class there (the other targets get it in-box or through System.Memory)
+                if ((uint)(e + n * 2 * VecPerElt - VecPerElt) <= (uint)v.Length)
                 {
-                    int e = (fw + i * 2 * NB_ELTS_V8) / VecF;
+                    // Range checked once above: unchecked accesses, 4x unrolled like upstream's _sse version.
+                    ref Vector<float> r = ref Unsafe.Add(ref MemoryMarshal.GetReference(v), e);
+                    int i = 0;
+                    if (VecPerElt == 1)
+                    {
+                        for (; i + 3 < n; i += 4, r = ref Unsafe.Add(ref r, 8))
+                        {
+                            r *= vc;
+                            Unsafe.Add(ref r, 2) *= vc;
+                            Unsafe.Add(ref r, 4) *= vc;
+                            Unsafe.Add(ref r, 6) *= vc;
+                        }
+                    }
+                    for (; i < n; i++, r = ref Unsafe.Add(ref r, 2 * VecPerElt))
+                    {
+                        for (int k = 0; k < VecPerElt; k++)
+                            Unsafe.Add(ref r, k) *= vc;
+                    }
+                    return;
+                }
+#endif
+                for (int i = start; i < end; ++i, e += 2 * VecPerElt)
+                {
                     for (int k = 0; k < VecPerElt; k++)
                         v[e + k] *= vc;
                 }
@@ -974,11 +961,7 @@ namespace OpenJpeg.Internal
                 {
                     fli.I = f[fl +  0 * NB_ELTS_V8 + c];
                     fwi.I = f[fw +  0 * NB_ELTS_V8 + c];
-#if TEST_MATH_MODE
-                    fli.F = (float)(fli.F + fwi.F) * cst;
-#else
                     fli.F = (fli.F + fwi.F) * cst;
-#endif
                     fwi.I = f[fw + -1 * NB_ELTS_V8 + c];
                     fwi.F += fli.F;
                     f[fw + -1 * NB_ELTS_V8 + c] = fwi.I;
@@ -990,11 +973,7 @@ namespace OpenJpeg.Internal
                     {
                         fli.I = f[fw + -2 * NB_ELTS_V8 + c];
                         fwi.I = f[fw +  0 * NB_ELTS_V8 + c];
-#if TEST_MATH_MODE
-                        fli.F = (float)(fli.F + fwi.F) * cst;
-#else
                         fli.F = (fli.F + fwi.F) * cst;
-#endif
                         fwi.I = f[fw + -1 * NB_ELTS_V8 + c];
                         fwi.F += fli.F;
                         f[fw + -1 * NB_ELTS_V8 + c] = fwi.I;
@@ -1008,11 +987,7 @@ namespace OpenJpeg.Internal
                 for (int c = 0; c < NB_ELTS_V8; c++)
                 {
                     fwi.I = f[fw + -2 * NB_ELTS_V8 + c];
-#if TEST_MATH_MODE
-                    fli.F = (float)(2 * fwi.F) * cst;
-#else
                     fli.F = (2 * fwi.F) * cst;
-#endif
                     fwi.I = f[fw + -1 * NB_ELTS_V8 + c];
                     fwi.F += fli.F;
                     f[fw + -1 * NB_ELTS_V8 + c] = fwi.I;
@@ -1021,6 +996,9 @@ namespace OpenJpeg.Internal
         }
 
         //2.5 - opj_v8dwt_decode_step2
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
         private static void v8dwt_decode_step2(float[] f, int fl, int fw, int start, int end, int m, float c)
         {
             int imax = Math.Min(end, m);
@@ -1034,20 +1012,48 @@ namespace OpenJpeg.Internal
                 // f[w - 1] += (f[l] + f[w]) * c, lane-wise; same operation order as the scalar code.
                 var v = MemoryMarshal.Cast<float, Vector<float>>(f.AsSpan());
                 var vc = new Vector<float>(c);
-                int i = start;
-                for (; i < imax; ++i)
+                // Vector indices, stepped directly: offsets are non-negative multiples of NB_ELTS_V8.
+                int vw = (int)((uint)fw / (uint)VecF), vl = (int)((uint)fl / (uint)VecF);
+                int n = Math.Max(imax - start, 0);
+#if !NETSTANDARD2_1
+                // Highest index touched: vw + 2n - 1 with the m < end tail, vw + 2n - 2 without.
+                if (VecPerElt == 1 && vw >= 1 && vl >= 0 && vw + 2 * n - (m < end ? 0 : 1) <= v.Length && vl < v.Length)
                 {
-                    int vw = fw / VecF, vl = fl / VecF, vo = (fw - NB_ELTS_V8) / VecF;
+                    // Range checked once above. Like upstream's _sse version, the right neighbour of each
+                    // update is carried to the next one in a register: two loads per element instead of three.
+                    ref Vector<float> r0 = ref MemoryMarshal.GetReference(v);
+                    ref Vector<float> w = ref Unsafe.Add(ref r0, vw);
+                    var left = Unsafe.Add(ref r0, vl);
+                    for (int i = 0; i < n; i++, w = ref Unsafe.Add(ref w, 2))
+                    {
+                        var right = w;
+                        ref Vector<float> o = ref Unsafe.Subtract(ref w, 1);
+                        o = o + ((left + right) * vc);
+                        left = right;
+                    }
+                    if (m < end)
+                    {
+                        Debug.Assert(m + 1 == end);
+                        vc = new Vector<float>(c + c);
+                        ref Vector<float> o = ref Unsafe.Subtract(ref w, 1);
+                        o = o + (left * vc);
+                    }
+                    return;
+                }
+#endif
+                for (int i = start; i < imax; ++i)
+                {
+                    int vo = vw - VecPerElt;
                     for (int k = 0; k < VecPerElt; k++)
                         v[vo + k] = v[vo + k] + ((v[vl + k] + v[vw + k]) * vc);
-                    fl = fw;
-                    fw += 2 * NB_ELTS_V8;
+                    vl = vw;
+                    vw += 2 * VecPerElt;
                 }
                 if (m < end)
                 {
                     Debug.Assert(m + 1 == end);
                     vc = new Vector<float>(c + c);
-                    int vl = fl / VecF, vo = (fw - NB_ELTS_V8) / VecF;
+                    int vo = vw - VecPerElt;
                     for (int k = 0; k < VecPerElt; k++)
                         v[vo + k] = v[vo + k] + (v[vl + k] * vc);
                 }
@@ -1072,18 +1078,6 @@ namespace OpenJpeg.Internal
                 //    i = i;
                 //}
 
-#if TEST_MATH_MODE
-                //C# We have a problem. AFAICT, C# likes to do double precision math
-                //   Liberal use of (float) seems to fix the issue. 
-                f[fw - 8] = f[fw - 8] + (float)((float)(f[fl + 0] + f[fw + 0]) * (float)c);
-                f[fw - 7] = f[fw - 7] + (float)((float)(f[fl + 1] + f[fw + 1]) * (float)c);
-                f[fw - 6] = f[fw - 6] + (float)((float)(f[fl + 2] + f[fw + 2]) * (float)c);
-                f[fw - 5] = f[fw - 5] + (float)((float)(f[fl + 3] + f[fw + 3]) * (float)c);
-                f[fw - 4] = f[fw - 4] + (float)((float)(f[fl + 4] + f[fw + 4]) * (float)c);
-                f[fw - 3] = f[fw - 3] + (float)((float)(f[fl + 5] + f[fw + 5]) * (float)c);
-                f[fw - 2] = f[fw - 2] + (float)((float)(f[fl + 6] + f[fw + 6]) * (float)c);
-                f[fw - 1] = f[fw - 1] + (float)((float)(f[fl + 7] + f[fw + 7]) * (float)c); 
-#else
                 //It's not a bug to have greater precision, it's a problem for verifying
                 //the result against original libary.
                 f[fw - 8] = f[fw - 8] + ((f[fl + 0] + f[fw + 0]) * c);
@@ -1094,7 +1088,6 @@ namespace OpenJpeg.Internal
                 f[fw - 3] = f[fw - 3] + ((f[fl + 5] + f[fw + 5]) * c);
                 f[fw - 2] = f[fw - 2] + ((f[fl + 6] + f[fw + 6]) * c);
                 f[fw - 1] = f[fw - 1] + ((f[fl + 7] + f[fw + 7]) * c);
-#endif
                 fl = fw;
                 fw += 2 * NB_ELTS_V8;
             }
@@ -1102,16 +1095,6 @@ namespace OpenJpeg.Internal
             {
                 Debug.Assert(m + 1 == end);
                 c += c;
-#if TEST_MATH_MODE
-                f[fw - 8] = f[fw - 8] + (float)(f[fl + 0] * (float)c);
-                f[fw - 7] = f[fw - 7] + (float)(f[fl + 1] * (float)c);
-                f[fw - 6] = f[fw - 6] + (float)(f[fl + 2] * (float)c);
-                f[fw - 5] = f[fw - 5] + (float)(f[fl + 3] * (float)c);
-                f[fw - 4] = f[fw - 4] + (float)(f[fl + 4] * (float)c);
-                f[fw - 3] = f[fw - 3] + (float)(f[fl + 5] * (float)c);
-                f[fw - 2] = f[fw - 2] + (float)(f[fl + 6] * (float)c);
-                f[fw - 1] = f[fw - 1] + (float)(f[fl + 7] * (float)c);
-#else
                 f[fw - 8] = f[fw - 8] + (f[fl + 0] * c);
                 f[fw - 7] = f[fw - 7] + (f[fl + 1] * c);
                 f[fw - 6] = f[fw - 6] + (f[fl + 2] * c);
@@ -1120,7 +1103,6 @@ namespace OpenJpeg.Internal
                 f[fw - 3] = f[fw - 3] + (f[fl + 5] * c);
                 f[fw - 2] = f[fw - 2] + (f[fl + 6] * c);
                 f[fw - 1] = f[fw - 1] + (f[fl + 7] * c);
-#endif
             }
         }
 
@@ -1203,11 +1185,7 @@ namespace OpenJpeg.Internal
                 //fw[-1] += (fl[0] + fw[0]) * c;
                 fw1.I = f[fl + 0];
                 fw2.I = f[fw + 0];
-#if TEST_MATH_MODE
-                fw2.F = (float)(fw1.F + fw2.F) * c;
-#else
                 fw2.F = (fw1.F + fw2.F) * c;
-#endif
                 fw1.I = f[fw - 1];
                 fw1.F += fw2.F;
                 f[fw - 1] = fw1.I;
@@ -1218,11 +1196,7 @@ namespace OpenJpeg.Internal
                     //fw[-1] += (fw[-2] + fw[0]) * c;
                     fw1.I = f[fw - 2];
                     fw2.I = f[fw + 0];
-#if TEST_MATH_MODE
-                    fw2.F = (float)(fw1.F + fw2.F) * c;
-#else
                     fw2.F = (fw1.F + fw2.F) * c;
-#endif
                     fw1.I = f[fw - 1];
                     fw1.F += fw2.F;
                     f[fw - 1] = fw1.I;
@@ -1230,11 +1204,7 @@ namespace OpenJpeg.Internal
                     //fw[1] += (fw[0] + fw[2]) * c;
                     fw1.I = f[fw + 0];
                     fw2.I = f[fw + 2];
-#if TEST_MATH_MODE
-                    fw2.F = (float)(fw1.F + fw2.F) * c;
-#else
                     fw2.F = (fw1.F + fw2.F) * c;
-#endif
                     fw1.I = f[fw + 1];
                     fw1.F += fw2.F;
                     f[fw + 1] = fw1.I;
@@ -1242,11 +1212,7 @@ namespace OpenJpeg.Internal
                     //fw[3] += (fw[2] + fw[4]) * c;
                     fw1.I = f[fw + 2];
                     fw2.I = f[fw + 4];
-#if TEST_MATH_MODE
-                    fw2.F = (float)(fw1.F + fw2.F) * c;
-#else
                     fw2.F = (fw1.F + fw2.F) * c;
-#endif
                     fw1.I = f[fw + 3];
                     fw1.F += fw2.F;
                     f[fw + 3] = fw1.I;
@@ -1254,11 +1220,7 @@ namespace OpenJpeg.Internal
                     //fw[5] += (fw[4] + fw[6]) * c;
                     fw1.I = f[fw + 4];
                     fw2.I = f[fw + 6];
-#if TEST_MATH_MODE
-                    fw2.F = (float)(fw1.F + fw2.F) * c;
-#else
                     fw2.F = (fw1.F + fw2.F) * c;
-#endif
                     fw1.I = f[fw + 5];
                     fw1.F += fw2.F;
                     f[fw + 5] = fw1.I;
@@ -1270,11 +1232,7 @@ namespace OpenJpeg.Internal
                     //fw[-1] += (fw[-2] + fw[0]) * c
                     fw1.I = f[fw - 2];
                     fw2.I = f[fw + 0];
-#if TEST_MATH_MODE
-                    fw2.F = (float)(fw1.F + fw2.F) * c;
-#else
                     fw2.F = (fw1.F + fw2.F) * c;
-#endif
                     fw1.I = f[fw - 1];
                     fw1.F += fw2.F;
                     f[fw - 1] = fw1.I;
@@ -1287,11 +1245,7 @@ namespace OpenJpeg.Internal
                 Debug.Assert(m + 1 == end);
                 //fw[-1] += (2 * fw[-2]) * c;
                 fw2.I = f[fw - 2];
-#if TEST_MATH_MODE
-                fw2.F = (float)(2 * fw2.F) * c;
-#else
                 fw2.F = (2 * fw2.F) * c;
-#endif
                 fw1.I = f[fw - 1];
                 fw1.F += fw2.F;
                 f[fw - 1] = fw1.I;
@@ -1329,15 +1283,16 @@ namespace OpenJpeg.Internal
 
             h_mem_size = MaxResolution(tr_ar, (int)numres);
             /* overflow check */
-            if (h_mem_size > (Constants.SIZE_MAX / PARALLEL_COLS_53 / sizeof(int)))
+            if (h_mem_size > (Constants.SIZE_MAX / (2 * PARALLEL_COLS_53) / sizeof(int)))
             {
                 return false;
             }
-            // We need PARALLEL_COLS_53 times the height of the array,
-            // since for the vertical pass
-            // we process PARALLEL_COLS_53 columns at a time
-            h_mem_size *= PARALLEL_COLS_53;
-            h.mem = new int[h_mem_size];
+            // We need 2 * PARALLEL_COLS_53 times the height of the array, since the vertical pass processes up to
+            // two strips of PARALLEL_COLS_53 columns at a time (upstream: one). No spare ints for the 64-byte offset
+            // of idwt53_v_cols: the pair kernels leave the last row of tmp free, and a rent above a power of two
+            // would double the pooled buffer.
+            h_mem_size *= 2 * PARALLEL_COLS_53;
+            h.mem = ArrayPool<int>.Shared.Rent((int)h_mem_size); // returned below; dirty is fine, as in upstream
             v.mem = h.mem;
 
                         {
@@ -1356,22 +1311,13 @@ namespace OpenJpeg.Internal
                     h.dn = (int)(rw - (uint)h.sn);
                     h.cas = tr.x0 % 2;
 
-                    if (num_threads <= 1 || rh <= 1)
+                    int num_jobs = DwtJobCount(num_threads, rh, (ulong)rw * rh);
+                    if (num_jobs <= 1)
                     {
-                        for (j = 0; j < rh; ++j)
-                        {
-                            idwt53_h(h, tilec.data, tiledp + (int)(j * w));
-                        }
+                        idwt53_h_rows(h, tilec.data, tiledp, (int)w, 0, (int)rh);
                     }
                     else
                     {
-                        int num_jobs = num_threads;
-
-                        if (rh < num_jobs)
-                        {
-                            num_jobs = (int)rh;
-                        }
-
                         uint step_j = (rh / (uint)num_jobs);
                         
                         var jobs = new List<decode_h_job>(num_jobs);
@@ -1397,25 +1343,18 @@ namespace OpenJpeg.Internal
                     v.dn = (int)(rh - (uint)v.sn);
                     v.cas = tr.y0 % 2;
  
-                    if (num_threads <= 1 || rw <= 1)
+                    num_jobs = DwtJobCount(num_threads, rw, (ulong)rw * rh);
+                    if (num_jobs <= 1)
                     {
-                        for (j = 0; j + PARALLEL_COLS_53 <= rw; j += PARALLEL_COLS_53)
-                        {
-                            idwt53_v(v, tilec.data, tiledp + (int)j, (int)w, (int)PARALLEL_COLS_53);
-                        }
-                        if (j < rw)
-                            idwt53_v(v, tilec.data, tiledp + (int)j, (int)w, (int)(rw - j));
+                        idwt53_v_cols(v, tilec.data, tiledp, (int)w, 0, (int)rw);
                     }
                     else
                     {
-                        int num_jobs = num_threads;
-
-                        if (rw < num_jobs)
-                        {
-                            num_jobs = (int)rw;
-                        }
-
-                        uint step_j = (rw / (uint)num_jobs);
+                        // Not in upstream: whole cache lines (16 ints) per job. A job that ends inside a line shares it with
+                        // the next job, and both write it on every row: 32 jobs of 78 columns took 2.3 ms on 10026 (one
+                        // thread: 3.0 ms), 80 columns 0.8 ms.
+                        uint step_j = (rw / (uint)num_jobs + 15u) & ~15u;
+                        num_jobs = (int)((rw + step_j - 1) / step_j);
 
                         var jobs = new List<decode_v_job>(num_jobs);
 
@@ -1437,8 +1376,20 @@ namespace OpenJpeg.Internal
                     }
                 }
             }
+            ArrayPool<int>.Shared.Return(h.mem);
             return true;
         }
+
+        /// <summary>Samples one DWT job should have at least: a fork/join costs more than a smaller job saves.</summary>
+        const ulong DwtMinSamplesPerJob = 65536;
+
+        /// <summary>
+        /// Jobs for one DWT pass over <paramref name="samples"/> samples that can be split into <paramref name="units"/>
+        /// independent rows, columns or strips. Rows and columns are independent, so the split does not change the output.
+        /// 1 or less means run inline.
+        /// </summary>
+        static int DwtJobCount(int num_threads, uint units, ulong samples) =>
+            (int)Math.Min((ulong)Math.Max(num_threads, 0), Math.Min(units, samples / DwtMinSamplesPerJob));
 
         //2.5
         static bool DecodePartialTile(TcdTilecomp tilec, uint numres)
@@ -1902,8 +1853,16 @@ namespace OpenJpeg.Internal
                             i_max = dn;
                         }
 
-                        //Snip SSE2 code. 
-
+#if NET7_0_OR_GREATER
+                        if (Vector128.IsHardwareAccelerated)
+                        {
+                            // Upstream SSE2 block: the 4 interleaved columns are one Vector128 per element.
+                            var va = MemoryMarshal.Cast<int, Vector128<int>>(a.AsSpan());
+                            var two = Vector128.Create(2);
+                            for (; i < i_max; i++)
+                                va[2 * i] -= (va[2 * i - 1] + va[2 * i + 1] + two) >> 2;
+                        }
+#endif
                         for (; i < i_max; i++)
                         {
                             /* No bound checking */
@@ -1939,8 +1898,15 @@ namespace OpenJpeg.Internal
                             i_max = sn - 1;
                         }
 
-                        //Snip SSE2 code. 
-
+#if NET7_0_OR_GREATER
+                        if (Vector128.IsHardwareAccelerated)
+                        {
+                            // Upstream SSE2 block, as above.
+                            var va = MemoryMarshal.Cast<int, Vector128<int>>(a.AsSpan());
+                            for (; i < i_max; i++)
+                                va[2 * i + 1] += (va[2 * i] + va[2 * i + 2]) >> 1;
+                        }
+#endif
                         for (; i < i_max; i++)
                         {
                             /* No bound checking */
@@ -2003,45 +1969,68 @@ namespace OpenJpeg.Internal
             }
         }
 
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
         static void v8dwt_interleave_h(v4dwt_local dwt, int[] a_ar, int a, int width, uint remaining_height)
         {
             float[] bi_ar = dwt.wavelet;
+            // The tile data holds float bits: copy them as ints (no IntOrFloat round trip through memory).
+            Span<int> wi = MemoryMarshal.Cast<float, int>(bi_ar.AsSpan());
             int bi = dwt.cas * NB_ELTS_V8; //C# NB_ELTS_V8 is because we're indexing into dwt.wavelet
             int x0 = (int)dwt.win_l_x0;
             int x1 = (int)dwt.win_l_x1;
 
-            //C# impl. note:
-            //Workaround for C's ability to treat float and
-            //int as raw data.
-            IntOrFloat fi = new IntOrFloat();
 
             for (int k = 0; k < 2; ++k)
             {
-                //C# impl note. (a & 0x0f) and (bi & 0x0f) checks if a "pointer" is aligned.
-                //Now, on C# the base pointer is always aligned, so this test should still work
-                if (remaining_height >= NB_ELTS_V8 && (a & 0x0f) == 0 && (bi & 0x0f) == 0)
+                // Upstream also requires 16-byte aligned pointers here. That check does not carry over to array
+                // indices (it ruled out every odd element), and both paths give the same result.
+                if (remaining_height >= NB_ELTS_V8)
                 {
                     // Fast code path
-                    // C# - I've not done any benchmarking.
-                    for (int i = x0; i < x1; ++i)
+                    int i = x0;
+#if NET8_0_OR_GREATER
+                    if (Avx.IsSupported)
+                    {
+                        // 8 columns at a time: load 8 contiguous row segments, transpose, store 8 elements.
+                        ReadOnlySpan<float> af = MemoryMarshal.Cast<int, float>(a_ar.AsSpan());
+                        Span<float> bf = bi_ar;
+                        for (; i + 8 <= x1; i += 8)
+                        {
+                            int j = a + i;
+                            var r0 = Vector256.Create(af.Slice(j, 8));
+                            var r1 = Vector256.Create(af.Slice(j + width, 8));
+                            var r2 = Vector256.Create(af.Slice(j + width * 2, 8));
+                            var r3 = Vector256.Create(af.Slice(j + width * 3, 8));
+                            var r4 = Vector256.Create(af.Slice(j + width * 4, 8));
+                            var r5 = Vector256.Create(af.Slice(j + width * 5, 8));
+                            var r6 = Vector256.Create(af.Slice(j + width * 6, 8));
+                            var r7 = Vector256.Create(af.Slice(j + width * 7, 8));
+                            Transpose8x8(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+                            int dst = bi + i * 2 * NB_ELTS_V8;
+                            r0.CopyTo(bf.Slice(dst));
+                            r1.CopyTo(bf.Slice(dst + 2 * NB_ELTS_V8));
+                            r2.CopyTo(bf.Slice(dst + 4 * NB_ELTS_V8));
+                            r3.CopyTo(bf.Slice(dst + 6 * NB_ELTS_V8));
+                            r4.CopyTo(bf.Slice(dst + 8 * NB_ELTS_V8));
+                            r5.CopyTo(bf.Slice(dst + 10 * NB_ELTS_V8));
+                            r6.CopyTo(bf.Slice(dst + 12 * NB_ELTS_V8));
+                            r7.CopyTo(bf.Slice(dst + 14 * NB_ELTS_V8));
+                        }
+                    }
+#endif
+                    for (; i < x1; ++i)
                     {
                         int j = a + i, dst = bi + i * 2 * NB_ELTS_V8;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 0] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 1] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 2] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 3] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 4] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 5] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 6] = fi.F;
-                        j += width; fi.I = a_ar[j];
-                        bi_ar[dst + 7] = fi.F;
+                        wi[dst + 0] = a_ar[j];
+                        j += width; wi[dst + 1] = a_ar[j];
+                        j += width; wi[dst + 2] = a_ar[j];
+                        j += width; wi[dst + 3] = a_ar[j];
+                        j += width; wi[dst + 4] = a_ar[j];
+                        j += width; wi[dst + 5] = a_ar[j];
+                        j += width; wi[dst + 6] = a_ar[j];
+                        j += width; wi[dst + 7] = a_ar[j];
                     }
                 }
                 else
@@ -2050,36 +2039,28 @@ namespace OpenJpeg.Internal
                     for (int i = x0; i < x1; ++i)
                     {
                         int j = a + i, dst = bi + i * 2 * NB_ELTS_V8;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 0] = fi.F;
+                        wi[dst + 0] = a_ar[j];
                         j += width;
                         if (remaining_height == 1) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 1] = fi.F;
+                        wi[dst + 1] = a_ar[j];
                         j += width;
                         if (remaining_height == 2) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 2] = fi.F;
+                        wi[dst + 2] = a_ar[j];
                         j += width;
                         if (remaining_height == 3) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 3] = fi.F;
+                        wi[dst + 3] = a_ar[j];
                         j += width;
                         if (remaining_height == 4) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 4] = fi.F;
+                        wi[dst + 4] = a_ar[j];
                         j += width;
                         if (remaining_height == 5) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 5] = fi.F;
+                        wi[dst + 5] = a_ar[j];
                         j += width;
                         if (remaining_height == 6) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 6] = fi.F;
+                        wi[dst + 6] = a_ar[j];
                         j += width;
                         if (remaining_height == 7) continue;
-                        fi.I = a_ar[j];
-                        bi_ar[dst + 7] = fi.F;
+                        wi[dst + 7] = a_ar[j];
                     }
                 }
 
@@ -2090,13 +2071,290 @@ namespace OpenJpeg.Internal
             }
         }
 
+        /// <summary>
+        /// Writes back 8 rows after a horizontal 9/7 pass: wavelet element k holds column k of the 8 rows,
+        /// so row n gets element k's value n (upstream: the two scalar loops in opj_dwt_decode_tile_97).
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
+        static void WriteBackRows8(float[] wavelet, Span<float> ajf, int aj, int w, int rw)
+        {
+            int k = 0;
+#if NET8_0_OR_GREATER
+            if (Avx.IsSupported)
+            {
+                // 8 elements at a time: an 8x8 transpose in registers turns 64 scattered stores into
+                // 8 contiguous ones. Pure data movement, so the output is unchanged.
+                ReadOnlySpan<float> wav = wavelet;
+                for (; k + 8 <= rw; k += 8)
+                {
+                    var r0 = Vector256.Create(wav.Slice((k + 0) * NB_ELTS_V8, 8));
+                    var r1 = Vector256.Create(wav.Slice((k + 1) * NB_ELTS_V8, 8));
+                    var r2 = Vector256.Create(wav.Slice((k + 2) * NB_ELTS_V8, 8));
+                    var r3 = Vector256.Create(wav.Slice((k + 3) * NB_ELTS_V8, 8));
+                    var r4 = Vector256.Create(wav.Slice((k + 4) * NB_ELTS_V8, 8));
+                    var r5 = Vector256.Create(wav.Slice((k + 5) * NB_ELTS_V8, 8));
+                    var r6 = Vector256.Create(wav.Slice((k + 6) * NB_ELTS_V8, 8));
+                    var r7 = Vector256.Create(wav.Slice((k + 7) * NB_ELTS_V8, 8));
+                    Transpose8x8(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+                    int o = aj + k;
+                    r0.CopyTo(ajf.Slice(o));
+                    r1.CopyTo(ajf.Slice(o + w));
+                    r2.CopyTo(ajf.Slice(o + w * 2));
+                    r3.CopyTo(ajf.Slice(o + w * 3));
+                    r4.CopyTo(ajf.Slice(o + w * 4));
+                    r5.CopyTo(ajf.Slice(o + w * 5));
+                    r6.CopyTo(ajf.Slice(o + w * 6));
+                    r7.CopyTo(ajf.Slice(o + w * 7));
+                }
+            }
+#endif
+            for (; k < rw; k++)
+            {
+                int k_wavelet = k * NB_ELTS_V8;
+                ajf[aj + k] = wavelet[k_wavelet + 0];
+                ajf[aj + k + w] = wavelet[k_wavelet + 1];
+                ajf[aj + k + w * 2] = wavelet[k_wavelet + 2];
+                ajf[aj + k + w * 3] = wavelet[k_wavelet + 3];
+                ajf[aj + k + w * 4] = wavelet[k_wavelet + 4];
+                ajf[aj + k + w * 5] = wavelet[k_wavelet + 5];
+                ajf[aj + k + w * 6] = wavelet[k_wavelet + 6];
+                ajf[aj + k + w * 7] = wavelet[k_wavelet + 7];
+            }
+        }
+
+#if NET8_0_OR_GREATER
+        /// <summary>In-register transpose of an 8x8 float matrix (rows r0..r7 become columns).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void Transpose8x8(ref Vector256<float> r0, ref Vector256<float> r1, ref Vector256<float> r2, ref Vector256<float> r3,
+                                 ref Vector256<float> r4, ref Vector256<float> r5, ref Vector256<float> r6, ref Vector256<float> r7)
+        {
+            var t0 = Avx.UnpackLow(r0, r1);
+            var t1 = Avx.UnpackHigh(r0, r1);
+            var t2 = Avx.UnpackLow(r2, r3);
+            var t3 = Avx.UnpackHigh(r2, r3);
+            var t4 = Avx.UnpackLow(r4, r5);
+            var t5 = Avx.UnpackHigh(r4, r5);
+            var t6 = Avx.UnpackLow(r6, r7);
+            var t7 = Avx.UnpackHigh(r6, r7);
+            var u0 = Avx.Shuffle(t0, t2, 0x44);
+            var u1 = Avx.Shuffle(t0, t2, 0xEE);
+            var u2 = Avx.Shuffle(t1, t3, 0x44);
+            var u3 = Avx.Shuffle(t1, t3, 0xEE);
+            var u4 = Avx.Shuffle(t4, t6, 0x44);
+            var u5 = Avx.Shuffle(t4, t6, 0xEE);
+            var u6 = Avx.Shuffle(t5, t7, 0x44);
+            var u7 = Avx.Shuffle(t5, t7, 0xEE);
+            r0 = Avx.Permute2x128(u0, u4, 0x20);
+            r1 = Avx.Permute2x128(u1, u5, 0x20);
+            r2 = Avx.Permute2x128(u2, u6, 0x20);
+            r3 = Avx.Permute2x128(u3, u7, 0x20);
+            r4 = Avx.Permute2x128(u0, u4, 0x31);
+            r5 = Avx.Permute2x128(u1, u5, 0x31);
+            r6 = Avx.Permute2x128(u2, u6, 0x31);
+            r7 = Avx.Permute2x128(u3, u7, 0x31);
+        }
+#endif
+
+        /// <summary>
+        /// Vertical 9/7 pass over ncols columns (a multiple of NB_ELTS_V8) starting at aj; returns ncols.
+        /// With vectors, two 8-column strips share each sweep over the rows: every row read then covers 16
+        /// floats (a whole cache line) and each memory page is visited once instead of twice. Each strip still
+        /// goes through the same interleave / lifting / write-back, so the result is unchanged.
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
+        static int VerticalStrips97(v4dwt_local v, int[] aj_ar, int aj, int w, int rh, int ncols)
+        {
+            int done = 0;
+            if (UseVectors && ncols >= 2 * NB_ELTS_V8)
+            {
+                var v2 = v.Clone();
+                v2.wavelet = ArrayPool<float>.Shared.Rent(v.wavelet.Length);
+                for (; done + 2 * NB_ELTS_V8 <= ncols; done += 2 * NB_ELTS_V8)
+                {
+                    v8dwt_interleave_v_pair(v, v2, aj_ar, aj + done, w);
+                    v8dwt_decode(v);
+                    v8dwt_decode(v2);
+                    CopyWaveletRowsBackPair(v.wavelet, v2.wavelet, rh, aj_ar, aj + done, w);
+                }
+                ArrayPool<float>.Shared.Return(v2.wavelet);
+            }
+            for (; done < ncols; done += NB_ELTS_V8)
+            {
+                v8dwt_interleave_v(v, aj_ar, aj + done, w, NB_ELTS_V8);
+                v8dwt_decode(v);
+                CopyWaveletRowsBack(v.wavelet, rh, aj_ar, aj + done, w);
+            }
+            return ncols;
+        }
+
+        /// <summary>
+        /// <see cref="v8dwt_interleave_v"/> for two adjacent 8-column strips in one sweep: columns 0-7 go to
+        /// <paramref name="v"/>, columns 8-15 to <paramref name="v2"/> (same windows and parity).
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
+        static void v8dwt_interleave_v_pair(v4dwt_local v, v4dwt_local v2, int[] a_ar, int a, int width)
+        {
+            var w1 = MemoryMarshal.Cast<float, Vector<int>>(v.wavelet.AsSpan());
+            var w2 = MemoryMarshal.Cast<float, Vector<int>>(v2.wavelet.AsSpan());
+#if !NETSTANDARD2_1
+            // Range checked once (rows a .. a + (sn + dn - 1) * width, 16 values each; highest wavelet element
+            // written is cas + 2 * (win_x1 - 1) of either half), then unchecked unaligned loads and stores.
+            long maxElt = Math.Max(v.win_l_x1 > 0 ? v.cas + 2L * (v.win_l_x1 - 1) : -1,
+                                   v.win_h_x1 > 0 ? 1 - v.cas + 2L * (v.win_h_x1 - 1) : -1);
+            if (VecPerElt == 1 && v.sn + v.dn > 0 && a >= 0
+                && (long)a + (long)(v.sn + v.dn - 1) * width + 2 * NB_ELTS_V8 <= a_ar.Length
+                && v.win_l_x1 <= (uint)v.sn && v.win_h_x1 <= (uint)v.dn
+                && maxElt < Math.Min(w1.Length, w2.Length))
+            {
+                ref byte src0 = ref Unsafe.As<int, byte>(ref MemoryMarshal.GetReference(a_ar.AsSpan()));
+                ref Vector<int> d1 = ref MemoryMarshal.GetReference(w1);
+                ref Vector<int> d2 = ref MemoryMarshal.GetReference(w2);
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    int x0 = (int)(pass == 0 ? v.win_l_x0 : v.win_h_x0), x1 = (int)(pass == 0 ? v.win_l_x1 : v.win_h_x1);
+                    int b = pass == 0 ? v.cas : 1 - v.cas, row0 = pass == 0 ? a : a + v.sn * width;
+                    for (int i = x0; i < x1; ++i)
+                    {
+                        ref byte r = ref Unsafe.Add(ref src0, (nint)(row0 + (long)i * width) * sizeof(int));
+                        Unsafe.Add(ref d1, b + i * 2) = Unsafe.ReadUnaligned<Vector<int>>(ref r);
+                        Unsafe.Add(ref d2, b + i * 2) = Unsafe.ReadUnaligned<Vector<int>>(ref Unsafe.Add(ref r, NB_ELTS_V8 * sizeof(int)));
+                    }
+                }
+                return;
+            }
+#endif
+            int bi = v.cas;
+            for (int i = (int)v.win_l_x0; i < v.win_l_x1; ++i)
+            {
+                int src = a + i * width, dst = (bi + i * 2) * VecPerElt;
+                for (int k = 0; k < VecPerElt; k++)
+                {
+                    w1[dst + k] = new Vector<int>(a_ar, src + k * VecF);
+                    w2[dst + k] = new Vector<int>(a_ar, src + NB_ELTS_V8 + k * VecF);
+                }
+            }
+            a += v.sn * width;
+            bi = 1 - v.cas;
+            for (int i = (int)v.win_h_x0; i < v.win_h_x1; ++i)
+            {
+                int src = a + i * width, dst = (bi + i * 2) * VecPerElt;
+                for (int k = 0; k < VecPerElt; k++)
+                {
+                    w1[dst + k] = new Vector<int>(a_ar, src + k * VecF);
+                    w2[dst + k] = new Vector<int>(a_ar, src + NB_ELTS_V8 + k * VecF);
+                }
+            }
+        }
+
+        /// <summary><see cref="CopyWaveletRowsBack"/> for two strips in one sweep (columns 0-7 from wavelet1, 8-15 from wavelet2).</summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
+        static void CopyWaveletRowsBackPair(float[] wavelet1, float[] wavelet2, int rows, int[] aj_ar, int aj, int w)
+        {
+            var w1 = MemoryMarshal.Cast<float, Vector<int>>(wavelet1.AsSpan());
+            var w2 = MemoryMarshal.Cast<float, Vector<int>>(wavelet2.AsSpan());
+#if !NETSTANDARD2_1
+            if (VecPerElt == 1 && rows > 0 && aj >= 0 && rows <= Math.Min(w1.Length, w2.Length)
+                && (long)aj + (long)(rows - 1) * w + 2 * NB_ELTS_V8 <= aj_ar.Length)
+            {
+                // Range checked once above, then unchecked unaligned stores.
+                ref byte dst0 = ref Unsafe.As<int, byte>(ref aj_ar[aj]);
+                ref Vector<int> s1 = ref MemoryMarshal.GetReference(w1);
+                ref Vector<int> s2 = ref MemoryMarshal.GetReference(w2);
+                for (int k = 0; k < rows; ++k)
+                {
+                    ref byte d = ref Unsafe.Add(ref dst0, (nint)((long)k * w) * sizeof(int));
+                    Unsafe.WriteUnaligned(ref d, Unsafe.Add(ref s1, k));
+                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, NB_ELTS_V8 * sizeof(int)), Unsafe.Add(ref s2, k));
+                }
+                return;
+            }
+#endif
+            for (int k = 0; k < rows; ++k)
+            {
+                int src = k * VecPerElt, dst = aj + k * w;
+                for (int e = 0; e < VecPerElt; e++)
+                {
+                    w1[src + e].CopyTo(aj_ar, dst + e * VecF);
+                    w2[src + e].CopyTo(aj_ar, dst + NB_ELTS_V8 + e * VecF);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Writes back the 8 decoded columns of a vertical 9/7 pass: row k of the wavelet buffer goes to
+        /// aj_ar[aj + k * w], 8 values each. Same as the Buffer.BlockCopy per row it replaces.
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
+        static void CopyWaveletRowsBack(float[] wavelet, int rows, int[] aj_ar, int aj, int w)
+        {
+            if (UseVectors)
+            {
+                var wv = MemoryMarshal.Cast<float, Vector<int>>(wavelet.AsSpan());
+#if !NETSTANDARD2_1
+                if (VecPerElt == 1 && rows > 0 && aj >= 0 && rows <= wv.Length
+                    && (long)aj + (long)(rows - 1) * w + NB_ELTS_V8 <= aj_ar.Length)
+                {
+                    // Range checked once above, then unchecked unaligned stores.
+                    ref byte dst0 = ref Unsafe.As<int, byte>(ref aj_ar[aj]);
+                    ref Vector<int> s1 = ref MemoryMarshal.GetReference(wv);
+                    for (int k = 0; k < rows; ++k)
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst0, (nint)((long)k * w) * sizeof(int)), Unsafe.Add(ref s1, k));
+                    return;
+                }
+#endif
+                for (int k = 0; k < rows; ++k)
+                {
+                    int src = k * VecPerElt, dst = aj + k * w;
+                    for (int e = 0; e < VecPerElt; e++)
+                        wv[src + e].CopyTo(aj_ar, dst + e * VecF);
+                }
+                return;
+            }
+            for (int k = 0; k < rows; ++k)
+                Buffer.BlockCopy(wavelet, k * NB_ELTS_V8 * sizeof(float), aj_ar, (aj + (k * w)) * sizeof(float), NB_ELTS_V8 * sizeof(float));
+        }
+
         //2.5
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)] // 9/7 DWT: see decode_tile_97
+#endif
         static void v8dwt_interleave_v(v4dwt_local dwt, int[] a_ar, int a, int width, int n_elts_read)
         {
             //C# Impl. Note that bi_ar is not a float[], but a wavelet array where each entery has 8 floating points.
             //         This while the a array is a plain float[]. I.e how they are to be indexed differers
             float[] bi_ar = dwt.wavelet;
             int bi = dwt.cas;
+
+            if (UseVectors && n_elts_read == NB_ELTS_V8)
+            {
+                // Wavelet elements start at multiples of NB_ELTS_V8 floats, so they index whole vectors.
+                var wv = MemoryMarshal.Cast<float, Vector<int>>(bi_ar.AsSpan());
+                for (int i = (int)dwt.win_l_x0; i < dwt.win_l_x1; ++i)
+                {
+                    int src = a + i * width, dst = (bi + i * 2) * VecPerElt;
+                    for (int k = 0; k < VecPerElt; k++)
+                        wv[dst + k] = new Vector<int>(a_ar, src + k * VecF);
+                }
+                a += dwt.sn * width;
+                bi = 1 - dwt.cas;
+                for (int i = (int)dwt.win_h_x0; i < dwt.win_h_x1; ++i)
+                {
+                    int src = a + i * width, dst = (bi + i * 2) * VecPerElt;
+                    for (int k = 0; k < VecPerElt; k++)
+                        wv[dst + k] = new Vector<int>(a_ar, src + k * VecF);
+                }
+                return;
+            }
 
             for (int i = (int)dwt.win_l_x0; i < dwt.win_l_x1; ++i)
                 Buffer.BlockCopy(a_ar, (a + i * width) * sizeof(float), bi_ar, (bi + i * 2) * NB_ELTS_V8 * sizeof(float), n_elts_read * sizeof(float));
@@ -2540,10 +2798,7 @@ namespace OpenJpeg.Internal
         //2.5
         private static void decode_h_func(decode_h_job job)
         {
-            for(int j = (int)job.min_j; j < job.max_j; j++)
-            {
-                idwt53_h(job.h, job.tiled, job.tiledp + j * (int)job.w);
-            }
+            idwt53_h_rows(job.h, job.tiled, job.tiledp, (int)job.w, (int)job.min_j, (int)job.max_j);
         }
 
         //2.5
@@ -2559,27 +2814,7 @@ namespace OpenJpeg.Internal
                 v8dwt_interleave_h(job.h, aj_ar, aj, w, NB_ELTS_V8);
                 v8dwt_decode(job.h);
 
-                // To be adapted if NB_ELTS_V8 changes
-                for (int k = 0; k < job.rw; k++)
-                {
-                    //C# note: Org. impl stores the wavlet as a struct with four
-                    //floating points. Here it's stored as a continious array. 
-                    int k_wavelet = k * NB_ELTS_V8;
-
-                    ajf[aj + k] = job.h.wavelet[k_wavelet + 0];
-                    ajf[aj + k + w] = job.h.wavelet[k_wavelet + 1];
-                    ajf[aj + k + w * 2] = job.h.wavelet[k_wavelet + 2];
-                    ajf[aj + k + w * 3] = job.h.wavelet[k_wavelet + 3];
-                }
-                for (int k = 0; k < job.rw; k++)
-                {
-                    int k_wavelet = k * NB_ELTS_V8;
-
-                    ajf[aj + k + w * 4] = job.h.wavelet[k_wavelet + 4];
-                    ajf[aj + k + w * 5] = job.h.wavelet[k_wavelet + 5];
-                    ajf[aj + k + w * 6] = job.h.wavelet[k_wavelet + 6];
-                    ajf[aj + k + w * 7] = job.h.wavelet[k_wavelet + 7];
-                }
+                WriteBackRows8(job.h.wavelet, ajf, aj, w, (int)job.rw);
 
                 aj += w * NB_ELTS_V8;
             }
@@ -2591,15 +2826,44 @@ namespace OpenJpeg.Internal
             var aj_ar = job.aj;
             var aj = job.ajp;
 
-            for (uint j = 0; j + NB_ELTS_V8 <= job.nb_columns; j += NB_ELTS_V8)
-            {
-                v8dwt_interleave_v(job.v, aj_ar, aj, (int)job.w, NB_ELTS_V8);
-                v8dwt_decode(job.v);
-                for (int k = 0; k < job.rh; ++k)
-                    Buffer.BlockCopy(job.v.wavelet, k * NB_ELTS_V8 * sizeof(float), aj_ar, (aj + (k * (int)job.w)) * sizeof(float), NB_ELTS_V8 * sizeof(float));
+            VerticalStrips97(job.v, aj_ar, aj, (int)job.w, (int)job.rh, (int)(job.nb_columns & ~(uint)(NB_ELTS_V8 - 1)));
+        }
 
-                aj += NB_ELTS_V8;
+        /// <summary>
+        /// Horizontal 5/3 pass over rows j0 .. j1 - 1 (row j starts at tiledp + j * w). Upstream calls opj_idwt53_h
+        /// per row; here the dispatch and the range check are done once, and on AVX2 the row kernel (even-start
+        /// rows, or odd-start rows with at least 9 high-pass samples) is inlined into the loop. Anything else goes
+        /// through <see cref="idwt53_h"/> row by row.
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
+        private static void idwt53_h_rows(dwt_local dwt, int[] tiled, int tiledp, int w, int j0, int j1)
+        {
+#if NET8_0_OR_GREATER
+            int sn = dwt.sn, len = sn + dwt.dn;
+            if (Avx2.IsSupported && j1 > j0 && w >= 0
+                && (long)tiledp + (long)j0 * w >= 0 && (long)tiledp + (long)(j1 - 1) * w + len <= tiled.Length
+                && len <= dwt.mem.Length)
+            {
+                ref int t = ref MemoryMarshal.GetArrayDataReference(tiled);
+                ref int outs = ref MemoryMarshal.GetArrayDataReference(dwt.mem);
+                if (dwt.cas == 0 && len > 1 && !Simd.Use512)
+                {
+                    for (int j = j0, row = tiledp + j0 * w; j < j1; j++, row += w)
+                        idwt53_h_cas0_avx2_row(ref t, ref outs, row, sn, len);
+                    return;
+                }
+                if (dwt.cas != 0 && len - sn >= 9)
+                {
+                    for (int j = j0, row = tiledp + j0 * w; j < j1; j++, row += w)
+                        idwt53_h_cas1_avx2_row(ref Unsafe.Add(ref t, row), ref outs, sn, len);
+                    return;
+                }
             }
+#endif
+            for (int j = j0; j < j1; j++)
+                idwt53_h(dwt, tiled, tiledp + j * w);
         }
 
         /// <summary>
@@ -2609,13 +2873,12 @@ namespace OpenJpeg.Internal
         /// 2.5
         /// Performs interleave, inverse wavelet transform and copy back to buffer
         /// </remarks>
+#if NETCOREAPP3_0_OR_GREATER
+        // Fully optimised from the first call (with the AVX2 row kernel): 10026 horizontal pass 5.5 ms -> 3.4 ms.
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
         private static void idwt53_h(dwt_local dwt, int[] tiled, int tiledp)
         {
-#if STANDARD_SLOW_VERSION
-            Interleave_h(dwt, tiledp, tiled);
-            Decode_1(dwt);
-            Buffer.BlockCopy(dwt.mem, 0, tiled, tiledp * sizeof(int), (dwt.sn + dwt.dn) * sizeof(int));
-#else
             int sn = dwt.sn;
             int len = sn + dwt.dn;
             if (dwt.cas == 0)
@@ -2642,152 +2905,372 @@ namespace OpenJpeg.Internal
                     int in_odd = tiledp;
                     o[1] = tiled[in_odd] - ((tiled[in_even] + 1) >> 1);
                     o[0] = tiled[in_even] + o[1];
-                    Buffer.BlockCopy(dwt.mem, 0, tiled, tiledp * sizeof(int), len * sizeof(int));
+                    dwt.mem.AsSpan(0, len).CopyTo(tiled.AsSpan(tiledp, len));
                 }
                 else if (len > 2)
                 {
                     opj_idwt53_h_cas1(dwt.mem, sn, len, tiled, tiledp);
                 }
             }
-#endif
         }
 
-#if STANDARD_SLOW_VERSION
+        //2.5
+#if NET8_0_OR_GREATER
         /// <summary>
-        /// Inverse 5-3 wavelet transform in 1-D.
+        /// AVX2 version of <see cref="idwt53_h_cas0"/>: 8 even and 8 odd outputs per iteration.
         /// </summary>
-        //2.1
-        static void Decode_1(dwt_local v)
+        /// <remarks>2.5.3 - the __AVX2__ branch of opj_idwt53_h_cas0 (upstream e0e0c802). Integer only, same results.</remarks>
+        // Fully optimised from the first call; see idwt53_h.
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void idwt53_h_cas0_avx2(int[] tmp, int sn, int len, int[] tiled, int tiledp)
         {
-            Decode_1_(v.mem, v.dn, v.sn, v.cas);
-        }
-
-        /// <summary>
-        /// Inverse 5-3 wavelet transform in 1-D.
-        /// </summary>
-        //2.1
-        static void Decode_1_(int[] a, int dn, int sn, int cas)
-        {
-            if (cas == 0)
+            // The row reads tiled[tiledp .. tiledp + len) and writes tmp[0 .. len). Checked once here so the row
+            // kernel can use unchecked accesses; otherwise take the checked code.
+            if (tiledp < 0 || (long)tiledp + len > tiled.Length || len > tmp.Length)
             {
-                if (dn > 0 || sn > 1)
+                idwt53_h_cas0_checked(tmp, sn, len, tiled, tiledp);
+                return;
+            }
+            idwt53_h_cas0_avx2_row(ref MemoryMarshal.GetArrayDataReference(tiled), ref MemoryMarshal.GetArrayDataReference(tmp), tiledp, sn, len);
+        }
+
+        /// <summary>
+        /// One row of <see cref="idwt53_h_cas0_avx2"/>, unchecked: the caller guarantees t[tiledp .. tiledp + len)
+        /// and outs[0 .. len) are inside their arrays. Inlined into the per-row-range loop of
+        /// <see cref="idwt53_h_rows"/>.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void idwt53_h_cas0_avx2_row(ref int t, ref int outs, int tiledp, int sn, int len)
+        {
+            if (len >= 18)
+            {
+                // Not upstream's loop (same values), see idwt53_h_cas0_avx2_step:
+                // - only the sn even inputs are copied out to outs; the outputs go straight into the row. Step b
+                //   writes row[2b .. 2b + 15] and the next one reads odd inputs from row[sn + b + 7 ..], so writes
+                //   stay behind the reads (b < sn). Upstream writes everything to tmp and copies all len values back.
+                // - steps at b = 0, 8, .. and a last one at dn - 9, the last that stays inside the row, instead of up
+                //   to 7 scalar iterations. It overlaps the previous step and rewrites the same values; its odd inputs
+                //   can lie under earlier outputs, so they are loaded first, with the odd values the end needs.
+                ref int row = ref Unsafe.Add(ref t, tiledp);
+                ref int odm1 = ref Unsafe.Add(ref row, sn - 1);
+                int dn = len - sn;
+                nuint last = (nuint)(dn - 9);
+                var ldm1 = Vector256.LoadUnsafe(ref odm1, last);
+                var ld0 = Vector256.LoadUnsafe(ref odm1, last + 1);
+                var ld1 = Vector256.LoadUnsafe(ref odm1, last + 2);
+                int d0 = Unsafe.Add(ref odm1, 1), dl2 = Unsafe.Add(ref odm1, dn - 1), dl = Unsafe.Add(ref odm1, dn);
+                CopyRowUnchecked(ref row, ref outs, sn);
+                ref int ev = ref outs;
+
+                var two = Vector256.Create(2);
+                for (nuint b = 0; b < last; b += 8)
                 {
-                    for (int i = 0; i < sn; i++)
-                    {
-                        //C# impl. of the macro: D_(i - 1) + D_(i)
-                        int D1 = (i - 1) < 0 ? 0 : (i - 1) >= dn ? (dn - 1) : (i - 1);
-                        int D2 = i < 0 ? 0 : i >= dn ? (dn - 1) : i;
-
-                        //S(i) -= (D_(i - 1) + D_(i) + 2) >> 2;
-                        a[i * 2] -= (a[1 + D1 * 2] + a[1 + D2 * 2] + 2) >> 2;
-                    }
-                    for (int i = 0; i < dn; i++)
-                    {
-                        //C# impl. of the macro: S_(i) + S_(i + 1)
-                        int S1 = i < 0 ? 0 : i >= sn ? (sn - 1) : i;
-                        int S2 = (i + 1) < 0 ? 0 : (i + 1) >= sn ? (sn - 1) : (i + 1);
-
-                        //D(i) += (S_(i) + S_(i + 1)) >> 1;
-                        a[1 + i * 2] += (a[S1 * 2] + a[S2 * 2]) >> 1;
-                    }
-                    //#define S(i) a[(i)*2]
-                    //#define D(i) a[(1+(i)*2)]
-                     //#define S_(i) ((i)<0?S(0):((i)>=sn?S(sn-1):S(i)))
-                    //#define SS_(i) ((i)<0?S(0):((i)>=dn?S(dn-1):S(i)))
-                     //#define D_(i) ((i)<0?D(0):((i)>=dn?D(dn-1):D(i)))
-                    //#define DD_(i) ((i)<0?D(0):((i)>=sn?D(sn-1):D(i)))
+                    idwt53_h_cas0_avx2_step(ref row, b, Vector256.LoadUnsafe(ref ev, b), Vector256.LoadUnsafe(ref ev, b + 1),
+                        Vector256.LoadUnsafe(ref odm1, b), Vector256.LoadUnsafe(ref odm1, b + 1), Vector256.LoadUnsafe(ref odm1, b + 2), two);
                 }
+                idwt53_h_cas0_avx2_step(ref row, last, Vector256.LoadUnsafe(ref ev, last), Vector256.LoadUnsafe(ref ev, last + 1), ldm1, ld0, ld1, two);
+
+                // Left boundary (the steps used the general formula for out[0]), then out[2dn - 2 ..], as upstream.
+                int e0 = ev - ((d0 + 1) >> 1);
+                row = e0;
+                Unsafe.Add(ref row, 1) = d0 + ((e0 + Unsafe.Add(ref row, 2)) >> 1);
+                int el = Unsafe.Add(ref ev, dn - 1) - ((dl2 + dl + 2) >> 2);
+                Unsafe.Add(ref row, 2 * dn - 2) = el;
+                if ((len & 1) != 0)
+                {
+                    int en = Unsafe.Add(ref ev, dn) - ((dl + 1) >> 1);
+                    Unsafe.Add(ref row, 2 * dn) = en;
+                    Unsafe.Add(ref row, 2 * dn - 1) = dl + ((el + en) >> 1);
+                }
+                else
+                {
+                    Unsafe.Add(ref row, 2 * dn - 1) = dl + el;
+                }
+                return;
+            }
+
+            // Short rows: scalar, carrying out[o] in a register (same values as upstream's tail loop).
+            int in_even = tiledp, in_odd = tiledp + sn, o = 0;
+            int cur = Unsafe.Add(ref t, in_even) - ((Unsafe.Add(ref t, in_odd) + 1) >> 1);
+            Unsafe.Add(ref outs, o) = cur;
+            for (int j = 1; j < len - 2; j += 2)
+            {
+                int d = Unsafe.Add(ref t, in_odd);
+                int next = Unsafe.Add(ref t, in_even + 1) - ((d + Unsafe.Add(ref t, in_odd + 1) + 2) >> 2);
+                Unsafe.Add(ref outs, o + 2) = next;
+                Unsafe.Add(ref outs, o + 1) = d + ((cur + next) >> 1);
+                cur = next;
+                in_even++;
+                in_odd++;
+                o += 2;
+            }
+
+            if ((len & 1) != 0)
+            {
+                int next = Unsafe.Add(ref t, in_even + 1) - ((Unsafe.Add(ref t, in_odd) + 1) >> 1);
+                Unsafe.Add(ref outs, o + 2) = next;
+                Unsafe.Add(ref outs, o + 1) = Unsafe.Add(ref t, in_odd) + ((cur + next) >> 1);
             }
             else
             {
-                if (sn == 0 && dn == 1)
-                    a[0] /= 2;
-                else
-                {
-                    for (int i = 0; i < sn; i++)
-                    {
-                        //C# impl. of the macro: SS_(i) + SS_(i + 1)
-                        int SS1 = i < 0 ? 0 : i >= dn ? (dn - 1) : i;
-                        int SS2 = (i + 1) < 0 ? 0 : (i + 1) >= dn ? (dn - 1) : (i + 1);
-
-                        //D(i) -= (SS_(i) + SS_(i + 1) + 2) >> 2;
-                        a[1 + i * 2] -= (a[SS1 * 2] + a[SS2 * 2] + 2) >> 2;
-                    }
-                    for (int i = 0; i < dn; i++)
-                    {
-                        //C# impl. of the macro: DD_(i) + DD_(i - 1)
-                        int DD1 = i < 0 ? 0 : i >= sn ? (sn - 1) : i;
-                        int DD2 = (i - 1) < 0 ? 0 : (i - 1) >= sn ? (sn - 1) : (i - 1);
-
-                        //S(i) += (DD_(i) + DD_(i - 1)) >> 1;
-                        a[i * 2] += (a[1 + DD1 * 2] + a[1 + DD2 * 2]) >> 1;
-                    }
-                }
+                Unsafe.Add(ref outs, o + 1) = Unsafe.Add(ref t, in_odd) + cur;
             }
+
+            CopyRowUnchecked(ref outs, ref Unsafe.Add(ref t, tiledp), len);
         }
 
-        
         /// <summary>
-        /// Inverse lazy transform (vertical).
+        /// Outputs 2b .. 2b + 15 of <see cref="idwt53_h_cas0_avx2_row"/> from even inputs e0 = ev[b .. b + 7],
+        /// e1 = ev[b + 1 .. b + 8] and odd inputs dm1 = od[b - 1 .. b + 6], d0 = od[b ..], d1 = od[b + 1 ..]. Both even
+        /// vectors (samples b .. b + 7 and b + 1 .. b + 8) are computed from loads; upstream shifts one into the other
+        /// with a lane permute, a blend and an extract, which all compete for the one shuffle port. out[0] (b = 0) comes
+        /// out wrong and is fixed by the caller.
         /// </summary>
-        //2.1
-        static void Interleave_v(dwt_local v, int a, int[] a_ar, int x)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void idwt53_h_cas0_avx2_step(ref int outs, nuint b, Vector256<int> e0, Vector256<int> e1,
+            Vector256<int> dm1, Vector256<int> d0, Vector256<int> d1, Vector256<int> two)
         {
-            int ai = a;
-            int bi = v.cas;
-            int[] b_ar = v.mem;
-            int i = v.sn;
-            while (i-- != 0)
+            var even_m1 = Avx2.Subtract(e0, Avx2.ShiftRightArithmetic(Avx2.Add(Avx2.Add(dm1, d0), two), 2));
+            var even = Avx2.Subtract(e1, Avx2.ShiftRightArithmetic(Avx2.Add(Avx2.Add(d0, d1), two), 2));
+            var odd = Avx2.Add(Avx2.ShiftRightArithmetic(Avx2.Add(even_m1, even), 1), d0);
+
+            var unpack1 = Avx2.UnpackLow(even_m1, odd);
+            var unpack2 = Avx2.UnpackHigh(even_m1, odd);
+            nuint o = 2 * b;
+            unpack1.GetLower().StoreUnsafe(ref outs, o);
+            unpack2.GetLower().StoreUnsafe(ref outs, o + 4);
+            unpack1.GetUpper().StoreUnsafe(ref outs, o + 8);
+            unpack2.GetUpper().StoreUnsafe(ref outs, o + 12);
+        }
+
+        /// <summary>
+        /// AVX2 version of <see cref="opj_idwt53_h_cas1"/> (rows starting on an odd coordinate) for dn = len - sn &gt;= 9,
+        /// unchecked: the caller guarantees row[0 .. len) and outs[0 .. len) are inside their arrays. Not in upstream,
+        /// which has no SIMD for this case; integer only, same values. Built like
+        /// <see cref="idwt53_h_cas0_avx2_row"/>: the low-pass inputs s are copied to outs[1 .. sn], the outputs go
+        /// straight into the row, a last overlapping step at dn - 9 instead of a scalar tail.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void idwt53_h_cas1_avx2_row(ref int row, ref int outs, int sn, int len)
+        {
+            // Output 2k is d[k] + ((s'[k - 1] + s'[k]) >> 1), output 2k + 1 is s'[k] = s[k] - ((d[k] + d[k + 1] + 2) >> 2).
+            // Step b writes row[2b .. 2b + 15] and reads d from row[sn + b - 1 ..]: earlier steps wrote up to row[2b - 1],
+            // so writes stay behind the reads (b < sn). The last step's d inputs and the boundary d values can lie under
+            // earlier outputs, so they are loaded first.
+            int dn = len - sn;
+            nuint last = (nuint)(dn - 9);
+            ref int dm1 = ref Unsafe.Add(ref row, sn - 1);
+            var ldm1 = Vector256.LoadUnsafe(ref dm1, last);
+            var ld0 = Vector256.LoadUnsafe(ref dm1, last + 1);
+            var ld1 = Vector256.LoadUnsafe(ref dm1, last + 2);
+            int d0 = Unsafe.Add(ref dm1, 1), dl = Unsafe.Add(ref dm1, dn);
+            CopyRowUnchecked(ref row, ref Unsafe.Add(ref outs, 1), sn);
+
+            var two = Vector256.Create(2);
+            for (nuint b = 0; b < last; b += 8)
             {
-                b_ar[bi] = a_ar[ai];
-                bi += 2;
-                ai += x;
+                idwt53_h_cas1_avx2_step(ref row, b, Vector256.LoadUnsafe(ref outs, b), Vector256.LoadUnsafe(ref outs, b + 1),
+                    Vector256.LoadUnsafe(ref dm1, b), Vector256.LoadUnsafe(ref dm1, b + 1), Vector256.LoadUnsafe(ref dm1, b + 2), two);
             }
-            ai = a + (v.sn * x);
-            bi = 1 - v.cas;
-            i = v.dn;
-            while (i-- != 0)
+            idwt53_h_cas1_avx2_step(ref row, last, Vector256.LoadUnsafe(ref outs, last), Vector256.LoadUnsafe(ref outs, last + 1), ldm1, ld0, ld1, two);
+
+            // Output 0 (the steps used s[-1], which does not exist), then the right boundary, as upstream.
+            row = d0 + Unsafe.Add(ref row, 1);
+            if ((len & 1) == 0)
             {
-                b_ar[bi] = a_ar[ai];
-                bi += 2;
-                ai += x;
+                int sl = Unsafe.Add(ref outs, sn) - ((dl + 1) >> 1);
+                Unsafe.Add(ref row, len - 2) = dl + ((sl + Unsafe.Add(ref row, len - 3)) >> 1);
+                Unsafe.Add(ref row, len - 1) = sl;
+            }
+            else
+            {
+                Unsafe.Add(ref row, len - 1) = dl + Unsafe.Add(ref row, len - 2);
             }
         }
-#else
-        //2.5
+
+        /// <summary>
+        /// Outputs 2b .. 2b + 15 of <see cref="idwt53_h_cas1_avx2_row"/> from low-pass inputs sm1 = s[b - 1 .. b + 6],
+        /// s0 = s[b .. b + 7] and high-pass inputs dm1 = d[b - 1 ..], d0 = d[b ..], d1 = d[b + 1 ..]. s'[k - 1] is
+        /// computed from loads rather than shifted from s'[k] (see <see cref="idwt53_h_cas0_avx2_step"/>).
+        /// Output 0 (b = 0) comes out wrong and is fixed by the caller.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void idwt53_h_cas1_avx2_step(ref int outs, nuint b, Vector256<int> sm1, Vector256<int> s0,
+            Vector256<int> dm1, Vector256<int> d0, Vector256<int> d1, Vector256<int> two)
+        {
+            var low_m1 = Avx2.Subtract(sm1, Avx2.ShiftRightArithmetic(Avx2.Add(Avx2.Add(dm1, d0), two), 2));
+            var low = Avx2.Subtract(s0, Avx2.ShiftRightArithmetic(Avx2.Add(Avx2.Add(d0, d1), two), 2));
+            var high = Avx2.Add(Avx2.ShiftRightArithmetic(Avx2.Add(low_m1, low), 1), d0);
+
+            var unpack1 = Avx2.UnpackLow(high, low);
+            var unpack2 = Avx2.UnpackHigh(high, low);
+            nuint o = 2 * b;
+            unpack1.GetLower().StoreUnsafe(ref outs, o);
+            unpack2.GetLower().StoreUnsafe(ref outs, o + 4);
+            unpack1.GetUpper().StoreUnsafe(ref outs, o + 8);
+            unpack2.GetUpper().StoreUnsafe(ref outs, o + 12);
+        }
+
+        /// <summary>Bounds-checked fallback for <see cref="idwt53_h_cas0_avx2"/>: the same lifting, scalar.</summary>
+        private static void idwt53_h_cas0_checked(int[] tmp, int sn, int len, int[] tiled, int tiledp)
+        {
+            int in_even = tiledp, in_odd = tiledp + sn, o = 0;
+            tmp[o] = tiled[in_even] - ((tiled[in_odd] + 1) >> 1);
+            for (int j = 1; j < len - 2; j += 2)
+            {
+                tmp[o + 2] = tiled[in_even + 1] - ((tiled[in_odd] + tiled[in_odd + 1] + 2) >> 2);
+                tmp[o + 1] = tiled[in_odd] + ((tmp[o] + tmp[o + 2]) >> 1);
+                in_even++;
+                in_odd++;
+                o += 2;
+            }
+            if ((len & 1) != 0)
+            {
+                tmp[o + 2] = tiled[in_even + 1] - ((tiled[in_odd] + 1) >> 1);
+                tmp[o + 1] = tiled[in_odd] + ((tmp[o] + tmp[o + 2]) >> 1);
+            }
+            else
+            {
+                tmp[o + 1] = tiled[in_odd] + tmp[o];
+            }
+            CopyRowBack(tmp, len, tiled, tiledp);
+        }
+#endif
+
+#if NET8_0_OR_GREATER
+        /// <summary>
+        /// Vector512 version of <see cref="idwt53_h_cas0"/>: 16 even and 16 odd outputs per iteration.
+        /// </summary>
+        /// <remarks>
+        /// 2.5.3 - the __AVX512F__ branch of opj_idwt53_h_cas0, written with cross-platform Vector512 operations
+        /// (the even/odd interleave uses widening instead of permutex2var). Integer only, same results.
+        /// </remarks>
+        private static void idwt53_h_cas0_512(int[] tmp, int sn, int len, int[] tiled, int tiledp)
+        {
+            ReadOnlySpan<int> t = tiled;
+            Span<int> outs = tmp;
+            int in_even = tiledp, in_odd = tiledp + sn, o = 0;
+            int prev_even = tiled[in_even] - ((tiled[in_odd] + 1) >> 1);
+            var two = Vector512.Create(2);
+            var move_right = Vector512.Create(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+            var lane0 = Vector512.Create(-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            var low32 = Vector512.Create(0xFFFFFFFFL);
+            int simd_batch = (len - 2) / 32;
+
+            for (int i = 0; i < simd_batch; i++)
+            {
+                var lf = Vector512.Create(t.Slice(in_even + 1, 16));
+                var hf1 = Vector512.Create(t.Slice(in_odd, 16));
+                var hf2 = Vector512.Create(t.Slice(in_odd + 1, 16));
+
+                var even = lf - ((hf1 + hf2 + two) >> 2);
+                int next_even = even.GetElement(15);
+                var even_m1 = Vector512.ConditionalSelect(lane0, Vector512.Create(prev_even), Vector512.Shuffle(even, move_right));
+
+                // out[0] + out[2]
+                var odd = ((even_m1 + even) >> 1) + hf1;
+
+                // Interleave even_m1 and odd: each 64-bit lane is (even_m1[k], odd[k]) in memory order.
+                var (eLo, eHi) = Vector512.Widen(even_m1);
+                var (oLo, oHi) = Vector512.Widen(odd);
+                ((eLo & low32) | (oLo << 32)).AsInt32().CopyTo(outs.Slice(o));
+                ((eHi & low32) | (oHi << 32)).AsInt32().CopyTo(outs.Slice(o + 16));
+
+                prev_even = next_even;
+                o += 32;
+                in_even += 16;
+                in_odd += 16;
+            }
+
+            tmp[o] = prev_even;
+            for (int j = simd_batch * 32 + 1; j < len - 2; j += 2)
+            {
+                tmp[o + 2] = tiled[in_even + 1] - ((tiled[in_odd] + tiled[in_odd + 1] + 2) >> 2);
+                tmp[o + 1] = tiled[in_odd] + ((tmp[o] + tmp[o + 2]) >> 1);
+                in_even++;
+                in_odd++;
+                o += 2;
+            }
+
+            if ((len & 1) != 0)
+            {
+                tmp[o + 2] = tiled[in_even + 1] - ((tiled[in_odd] + 1) >> 1);
+                tmp[o + 1] = tiled[in_odd] + ((tmp[o] + tmp[o + 2]) >> 1);
+            }
+            else
+            {
+                tmp[o + 1] = tiled[in_odd] + tmp[o];
+            }
+
+            CopyRowBack(tmp, len, tiled, tiledp);
+        }
+#endif
+
+        /// <summary>
+        /// Copies tmp[0 .. len) to tiled[tiledp ..]: the end of each horizontal 5/3 row. An own unchecked vector loop
+        /// instead of Span.CopyTo, whose precompiled (ReadyToRun) Buffer.Memmove runs until tier-up, or always with
+        /// tiering off, and measured 3x slower on these rows (10719 horizontal pass, tiering off: 31.6 ms vs 9.5 ms).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void CopyRowBack(int[] tmp, int len, int[] tiled, int tiledp)
+        {
+#if NET7_0_OR_GREATER
+            if (Vector256.IsHardwareAccelerated && (uint)len <= (uint)tmp.Length && tiledp >= 0 && (long)tiledp + len <= tiled.Length)
+            {
+                // Range checked above; tmp and tiled are different arrays, so no overlap.
+                CopyRowUnchecked(ref MemoryMarshal.GetArrayDataReference(tmp),
+                                 ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(tiled), tiledp), len);
+                return;
+            }
+#endif
+            tmp.AsSpan(0, len).CopyTo(tiled.AsSpan(tiledp, len));
+        }
+
+#if NET7_0_OR_GREATER
+        /// <summary>Copies len ints from src to dst (not overlapping), unchecked, 256-bit vectors.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void CopyRowUnchecked(ref int src, ref int dst, int len)
+        {
+            // nuint index: no sign extension per access
+            nuint i = 0, n = (nuint)len;
+            for (; i + 32 <= n; i += 32)
+            {
+                var a = Vector256.LoadUnsafe(ref src, i);
+                var b = Vector256.LoadUnsafe(ref src, i + 8);
+                var c = Vector256.LoadUnsafe(ref src, i + 16);
+                var d = Vector256.LoadUnsafe(ref src, i + 24);
+                a.StoreUnsafe(ref dst, i);
+                b.StoreUnsafe(ref dst, i + 8);
+                c.StoreUnsafe(ref dst, i + 16);
+                d.StoreUnsafe(ref dst, i + 24);
+            }
+            for (; i + 8 <= n; i += 8)
+                Vector256.LoadUnsafe(ref src, i).StoreUnsafe(ref dst, i);
+            for (; i < n; i++)
+                Unsafe.Add(ref dst, i) = Unsafe.Add(ref src, i);
+        }
+#endif
+
         private static void idwt53_h_cas0(int[] tmp, int sn, int len, int[] tiled, int tiledp)
         {
             Debug.Assert(len > 1);
+#if NET8_0_OR_GREATER
+            if (Simd.Use512)
+            {
+                idwt53_h_cas0_512(tmp, sn, len, tiled, tiledp);
+                return;
+            }
+            if (Avx2.IsSupported)
+            {
+                idwt53_h_cas0_avx2(tmp, sn, len, tiled, tiledp);
+                return;
+            }
+#endif
 
             int i, j;
             int in_even = tiledp;
             int in_odd = tiledp + sn;
 
-#if TWO_PASS_VERSION
-            /* For documentation purpose: performs lifting in two iterations, */
-            /* but without explicit interleaving */
-
-            /* Even */
-            tmp[0] = tiled[in_even] - ((tiled[in_odd] + 1) >> 1);
-            for (i = 2, j = 0; i <= len - 2; i += 2, j++)
-            {
-                tmp[i] = tiled[in_even + j + 1] - ((tiled[in_odd + j] + tiled[in_odd + j + 1] + 2) >> 2);
-            }
-            if ((len & 1) != 0)
-            { /* if len is odd */
-                tmp[len - 1] = tiled[in_even + (len - 1) / 2] - ((tiled[in_odd + (len - 2) / 2] + 1) >> 1);
-            }
-
-            /* Odd */
-            for (i = 1, j = 0; i < len - 1; i += 2, j++)
-            {
-                tmp[i] = tiled[in_odd + j] + ((tmp[i - 1] + tmp[i + 1]) >> 1);
-            }
-            if ((len & 1) == 0)
-            { /* if len is even */
-                tmp[len - 1] = tiled[in_odd + (len - 1) / 2] + tmp[len - 2];
-            }
-#else
             // Improved version of the TWO_PASS_VERSION:
             // Performs lifting in one single iteration. Saves memory
             // accesses and explicit interleaving.
@@ -2823,8 +3306,7 @@ namespace OpenJpeg.Internal
             {
                 tmp[len - 1] = d1n + s0n;
             }
-#endif
-            Buffer.BlockCopy(tmp, 0, tiled, tiledp * sizeof(int), len * sizeof(int));
+            CopyRowBack(tmp, len, tiled, tiledp);
         }
 
         //2.5
@@ -2836,31 +3318,6 @@ namespace OpenJpeg.Internal
             int in_even = tiledp + sn;
             int in_odd = tiledp;
 
-#if TWO_PASS_VERSION
-            /* For documentation purpose: performs lifting in two iterations, */
-            /* but without explicit interleaving */
-
-            /* Odd */
-            for (i = 1, j = 0; i < len - 1; i += 2, j++)
-            {
-                tmp[i] = tiled[in_odd + j] - ((tiled[in_even + j] + tiled[in_even + j + 1] + 2) >> 2);
-            }
-            if ((len & 1) == 0)
-            {
-                tmp[len - 1] = tiled[in_odd + len / 2 - 1] - ((tiled[in_even + len / 2 - 1] + 1) >> 1);
-            }
-
-            /* Even */
-            tmp[0] = tiled[in_even] + tmp[1];
-            for (i = 2, j = 1; i < len - 1; i += 2, j++)
-            {
-                tmp[i] = tiled[in_even + j] + ((tmp[i + 1] + tmp[i - 1]) >> 1);
-            }
-            if ((len & 1) != 0)
-            {
-                tmp[len - 1] = tiled[in_even + len / 2] + tmp[len - 2];
-            }
-#else
             int s1, s2, dc, dn;
 
             /* Improved version of the TWO_PASS_VERSION: */
@@ -2897,8 +3354,7 @@ namespace OpenJpeg.Internal
             {
                 tmp[len - 1] = s1 + dc;
             }
-#endif
-            Buffer.BlockCopy(tmp, 0, tiled, tiledp * sizeof(int), len * sizeof(int));
+            CopyRowBack(tmp, len, tiled, tiledp);
         }
 
         //2.5
@@ -3002,18 +3458,56 @@ namespace OpenJpeg.Internal
                 tiled[tiledp_col + i * stride] = tmp[i];
             }
         }
-#endif
 
         //2.5
         private static void decode_v_func(decode_v_job job)
         {
-            int j;
-            for (j = (int)job.min_j; j + PARALLEL_COLS_53 <= job.max_j; j += (int)PARALLEL_COLS_53)
+            idwt53_v_cols(job.v, job.tiled, job.tiledp, (int)job.w, (int)job.min_j, (int)job.max_j);
+        }
+
+        /// <summary>
+        /// Vertical 5/3 pass over columns j0 .. j1 - 1 (the single-thread loop and each job). Upstream calls
+        /// opj_idwt53_v per PARALLEL_COLS_53 columns; on AVX2 the columns go two strips per sweep instead
+        /// (<see cref="idwt53_v_cas0_mcols2"/>, <see cref="idwt53_v_cas1_mcols2"/>), the rest as upstream.
+        /// </summary>
+        private static void idwt53_v_cols(dwt_local v, int[] tiled, int tiledp, int stride, int j0, int j1)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            int j = j0;
+#if NET8_0_OR_GREATER
+            int len = v.sn + v.dn, pairs = (j1 - j0) / (2 * P);
+            // Same length conditions as the vector paths of idwt53_v (cas1 handles len 1 and 2 separately)
+            if (pairs > 0 && len > (v.cas == 0 ? 1 : 2) && UseVectors53 && !Simd.Use512 && 2 * Vector<int>.Count == P
+                && tiledp + j0 >= 0 && stride >= 0 && 2L * P * len <= v.mem.Length
+                && (long)tiledp + j0 + (long)(len - 1) * stride + 2L * P * pairs <= tiled.Length)
             {
-                idwt53_v(job.v, job.tiled, job.tiledp +j, (int)job.w, (int)PARALLEL_COLS_53);
+                // tmp starts on a 64-byte boundary (as upstream's, which is 32-byte aligned), pinned meanwhile so that
+                // it stays there: vertical pass -7% to -9% on 256x256 tiles. The pair kernels use rows 0 .. len - 2
+                // of tmp (the last row goes straight into the tile), so the offset (at most 14 ints) always fits.
+                var pin = GCHandle.Alloc(v.mem, GCHandleType.Pinned);
+                try
+                {
+                    int off = (int)((-(long)pin.AddrOfPinnedObject() & 63) / sizeof(int));
+                    if (off + 2L * P * (len - 1) > v.mem.Length)
+                        off = 0;
+                    for (; j + 2 * P <= j1; j += 2 * P)
+                    {
+                        if (v.cas == 0)
+                            idwt53_v_cas0_mcols2(v.mem, off, v.sn, len, tiled, tiledp + j, stride);
+                        else
+                            idwt53_v_cas1_mcols2(v.mem, off, v.sn, len, tiled, tiledp + j, stride);
+                    }
+                }
+                finally
+                {
+                    pin.Free();
+                }
             }
-            if (j < job.max_j)
-                idwt53_v(job.v, job.tiled, job.tiledp + j, (int)job.w, (int)(job.max_j - j));
+#endif
+            for (; j + P <= j1; j += P)
+                idwt53_v(v, tiled, tiledp + j, stride, P);
+            if (j < j1)
+                idwt53_v(v, tiled, tiledp + j, stride, j1 - j);
         }
 
 #if NET7_0_OR_GREATER
@@ -3021,18 +3515,314 @@ namespace OpenJpeg.Internal
         static readonly bool UseVectors53 = Vector.IsHardwareAccelerated && PARALLEL_COLS_53 % Vector<int>.Count == 0;
 
         /// <summary>
+        /// Copies len rows of PARALLEL_COLS_53 values from tmp back into the tile (upstream opj_idwt53_v_final_memcpy):
+        /// vector stores instead of one Array.Copy call per 16-value row.
+        /// </summary>
+        /// <summary>
+        /// True when rows 0 .. len - 1 of the PARALLEL_COLS_53 columns at tiledp_col, and tmp[0 .. P * len), are
+        /// inside their arrays: the only elements the mcols passes touch.
+        /// </summary>
+        static bool ColumnsInRange(int[] tmp, int len, int[] tiled, int tiledp_col, int stride)
+            => len > 0 && tiledp_col >= 0 && stride >= 0 && (long)PARALLEL_COLS_53 * len <= tmp.Length
+               && (long)tiledp_col + (long)(len - 1) * stride + PARALLEL_COLS_53 <= tiled.Length;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static Vector<int> Ld(ref int b, int i) => Unsafe.ReadUnaligned<Vector<int>>(ref Unsafe.As<int, byte>(ref Unsafe.Add(ref b, i)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void St(ref int b, int i, Vector<int> v) => Unsafe.WriteUnaligned(ref Unsafe.As<int, byte>(ref Unsafe.Add(ref b, i)), v);
+
+        /// <summary><see cref="CopyColumnsBack"/> without bounds checks; callers check <see cref="ColumnsInRange"/>.</summary>
+        // Fully optimised from the first call: under tiering this loop otherwise ran as OSR code for whole decodes.
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        static void CopyColumnsBackUnchecked(int[] tmp, int first, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            ref int t = ref tiled[tiledp_col];
+            ref int o = ref tmp[0];
+            for (int i = first, dst = first * stride; i < len; ++i, dst += stride)
+                for (int c = 0; c < P; c += V)
+                    St(ref t, dst + c, Ld(ref o, P * i + c));
+        }
+
+        static void CopyColumnsBack(int[] tmp, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            for (int i = 0; i < len; ++i)
+            {
+                int src = P * i, dst = tiledp_col + i * stride;
+                for (int c = 0; c < P; c += V)
+                    new Vector<int>(tmp, src + c).CopyTo(tiled, dst + c);
+            }
+        }
+
+        /// <summary>
+        /// Two adjacent strips of <see cref="idwt53_v_cas0_mcols"/> (2 * PARALLEL_COLS_53 columns, four vectors per
+        /// row) in one sweep over the rows. When a strip does not start on a 64-byte boundary its rows span two cache
+        /// lines and the next strip shares one of them; strip by strip that line is fetched twice. Same arithmetic
+        /// per column. Callers check the ranges (rows 0 .. len - 1 of the 2P columns, tmp[off .. off + 2P * (len - 1))).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void idwt53_v_cas0_mcols2(int[] tmp, int off, int sn, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int Q = 2 * (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            var two = new Vector<int>(2);
+            ref int t = ref tiled[tiledp_col];
+            ref int o = ref tmp[off];
+            int od = sn * stride;
+            var d0 = Ld(ref t, od); var d1 = Ld(ref t, od + V); var d2 = Ld(ref t, od + 2 * V); var d3 = Ld(ref t, od + 3 * V);
+            var s0 = Ld(ref t, 0) - ((d0 + d0 + two) >> 2);
+            var s1 = Ld(ref t, V) - ((d1 + d1 + two) >> 2);
+            var s2 = Ld(ref t, 2 * V) - ((d2 + d2 + two) >> 2);
+            var s3 = Ld(ref t, 3 * V) - ((d3 + d3 + two) >> 2);
+
+            // In-loop write-back as in idwt53_v_cas0_mcols, under the same stride condition.
+            bool inLoop = (stride & 127) != 0;
+            if (inLoop)
+            {
+                St(ref t, 0, s0); St(ref t, V, s1); St(ref t, 2 * V, s2); St(ref t, 3 * V, s3);
+            }
+            // Output rows i, i + 1 go to dst[oe], dst[oe + oq]: tmp first, then from the first even row at or after sn
+            // (iT) straight into the tile. Step i reads tile rows i / 2 + 1 and sn + i / 2 + 1, so rows sn .. i + 1 have
+            // been read and are not needed again; they skip tmp and the copy-back. Not in upstream. Only with the
+            // in-loop write-back: on strides of a multiple of 128 ints these rows have mostly left L1 by then (+8% on
+            // 256x256 tiles), and the copy-back afterwards is faster.
+            ref int dst = ref o;
+            int oe = 0, oq = Q, iT = inLoop ? (sn + 1) & ~1 : int.MaxValue;
+            int i = 0, re = stride, ro = od + stride;
+            for (; i < len - 3; i += 2, re += stride, ro += stride, oe += 2 * oq)
+            {
+                if (i == iT)
+                {
+                    dst = ref t; oe = i * stride; oq = stride;
+                }
+                int oo = oe + oq;
+                var dn = Ld(ref t, ro); var sx = Ld(ref t, re) - ((d0 + dn + two) >> 2);
+                St(ref dst, oe, s0); St(ref dst, oo, d0 + ((s0 + sx) >> 1)); d0 = dn; s0 = sx;
+                dn = Ld(ref t, ro + V); sx = Ld(ref t, re + V) - ((d1 + dn + two) >> 2);
+                St(ref dst, oe + V, s1); St(ref dst, oo + V, d1 + ((s1 + sx) >> 1)); d1 = dn; s1 = sx;
+                dn = Ld(ref t, ro + 2 * V); sx = Ld(ref t, re + 2 * V) - ((d2 + dn + two) >> 2);
+                St(ref dst, oe + 2 * V, s2); St(ref dst, oo + 2 * V, d2 + ((s2 + sx) >> 1)); d2 = dn; s2 = sx;
+                dn = Ld(ref t, ro + 3 * V); sx = Ld(ref t, re + 3 * V) - ((d3 + dn + two) >> 2);
+                St(ref dst, oe + 3 * V, s3); St(ref dst, oo + 3 * V, d3 + ((s3 + sx) >> 1)); d3 = dn; s3 = sx;
+                if (inLoop)
+                {
+                    // Row i / 2 + 1 < sn <= iT: still in tmp
+                    int ow = Q * (i / 2 + 1);
+                    St(ref t, re, Ld(ref o, ow)); St(ref t, re + V, Ld(ref o, ow + V));
+                    St(ref t, re + 2 * V, Ld(ref o, ow + 2 * V)); St(ref t, re + 3 * V, Ld(ref o, ow + 3 * V));
+                }
+            }
+            int copied = inLoop ? i / 2 + 1 : 0;
+            int oi = Q * i;
+            St(ref o, oi, s0); St(ref o, oi + V, s1); St(ref o, oi + 2 * V, s2); St(ref o, oi + 3 * V, s3);
+
+            // The last output row goes straight into the tile: its input (high-pass row dn - 1) is in d0..d3 by now
+            // and the odd-length tail only reads row (len - 1) / 2 < len - 1. tmp then needs rows 0 .. len - 2 only.
+            int ol = (len - 1) * stride, ol2 = Q * (len - 2);
+            if ((len & 1) != 0)
+            {
+                int rl = ((len - 1) / 2) * stride;
+                var l = Ld(ref t, rl) - ((d0 + d0 + two) >> 2);
+                St(ref t, ol, l); St(ref o, ol2, d0 + ((s0 + l) >> 1));
+                l = Ld(ref t, rl + V) - ((d1 + d1 + two) >> 2);
+                St(ref t, ol + V, l); St(ref o, ol2 + V, d1 + ((s1 + l) >> 1));
+                l = Ld(ref t, rl + 2 * V) - ((d2 + d2 + two) >> 2);
+                St(ref t, ol + 2 * V, l); St(ref o, ol2 + 2 * V, d2 + ((s2 + l) >> 1));
+                l = Ld(ref t, rl + 3 * V) - ((d3 + d3 + two) >> 2);
+                St(ref t, ol + 3 * V, l); St(ref o, ol2 + 3 * V, d3 + ((s3 + l) >> 1));
+            }
+            else
+            {
+                St(ref t, ol, d0 + s0); St(ref t, ol + V, d1 + s1); St(ref t, ol + 2 * V, d2 + s2); St(ref t, ol + 3 * V, d3 + s3);
+            }
+
+            // Rows min(iT, i) .. i - 1 and len - 1 are in the tile already
+            CopyRows2Back(ref o, ref t, copied, Math.Min(iT, i), stride);
+            CopyRows2Back(ref o, ref t, i, len - 1, stride);
+        }
+
+        /// <summary>Copies rows r0 .. r1 - 1 of 2 * PARALLEL_COLS_53 columns from tmp (o) back into the tile (t).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void CopyRows2Back(ref int o, ref int t, int r0, int r1, int stride)
+        {
+            const int Q = 2 * (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            for (int r = r0, dst = r0 * stride, src = r0 * Q; r < r1; r++, dst += stride, src += Q)
+            {
+                St(ref t, dst, Ld(ref o, src)); St(ref t, dst + V, Ld(ref o, src + V));
+                St(ref t, dst + 2 * V, Ld(ref o, src + 2 * V)); St(ref t, dst + 3 * V, Ld(ref o, src + 3 * V));
+            }
+        }
+
+        /// <summary>
+        /// Two adjacent strips of <see cref="idwt53_v_cas1_mcols"/> in one sweep over the rows, as
+        /// <see cref="idwt53_v_cas0_mcols2"/> does for even-start columns. Callers check the same ranges.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void idwt53_v_cas1_mcols2(int[] tmp, int off, int sn, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int Q = 2 * (int)PARALLEL_COLS_53;
+            int V = Vector<int>.Count;
+            var two = new Vector<int>(2);
+            ref int t = ref tiled[tiledp_col];
+            ref int o = ref tmp[off];
+            int ev = sn * stride;
+            var s0 = Ld(ref t, ev + stride); var s1 = Ld(ref t, ev + stride + V);
+            var s2 = Ld(ref t, ev + stride + 2 * V); var s3 = Ld(ref t, ev + stride + 3 * V);
+            var e = Ld(ref t, ev); var c0 = Ld(ref t, 0) - ((e + s0 + two) >> 2); var r0 = e + c0;
+            e = Ld(ref t, ev + V); var c1 = Ld(ref t, V) - ((e + s1 + two) >> 2); var r1 = e + c1;
+            e = Ld(ref t, ev + 2 * V); var c2 = Ld(ref t, 2 * V) - ((e + s2 + two) >> 2); var r2 = e + c2;
+            e = Ld(ref t, ev + 3 * V); var c3 = Ld(ref t, 3 * V) - ((e + s3 + two) >> 2); var r3 = e + c3;
+            St(ref o, 0, r0); St(ref o, V, r1); St(ref o, 2 * V, r2); St(ref o, 3 * V, r3);
+
+            // In-loop write-back as in idwt53_v_cas1_mcols, under the same stride condition.
+            bool inLoop = (stride & 127) != 0;
+            if (inLoop)
+            {
+                St(ref t, 0, r0); St(ref t, V, r1); St(ref t, 2 * V, r2); St(ref t, 3 * V, r3);
+            }
+            int i = 1, rs2 = ev + 2 * stride, rd = stride, wo = Q;
+            int end = len - 2 - ((len & 1) == 0 ? 1 : 0);
+            for (; i < end; i += 2, rs2 += stride, rd += stride, wo += Q)
+            {
+                int oa = Q * i, ob = oa + Q;
+                var sx = Ld(ref t, rs2); var dn = Ld(ref t, rd) - ((s0 + sx + two) >> 2);
+                St(ref o, oa, c0); St(ref o, ob, s0 + ((dn + c0) >> 1)); c0 = dn; s0 = sx;
+                sx = Ld(ref t, rs2 + V); dn = Ld(ref t, rd + V) - ((s1 + sx + two) >> 2);
+                St(ref o, oa + V, c1); St(ref o, ob + V, s1 + ((dn + c1) >> 1)); c1 = dn; s1 = sx;
+                sx = Ld(ref t, rs2 + 2 * V); dn = Ld(ref t, rd + 2 * V) - ((s2 + sx + two) >> 2);
+                St(ref o, oa + 2 * V, c2); St(ref o, ob + 2 * V, s2 + ((dn + c2) >> 1)); c2 = dn; s2 = sx;
+                sx = Ld(ref t, rs2 + 3 * V); dn = Ld(ref t, rd + 3 * V) - ((s3 + sx + two) >> 2);
+                St(ref o, oa + 3 * V, c3); St(ref o, ob + 3 * V, s3 + ((dn + c3) >> 1)); c3 = dn; s3 = sx;
+                if (inLoop)
+                {
+                    St(ref t, rd, Ld(ref o, wo)); St(ref t, rd + V, Ld(ref o, wo + V));
+                    St(ref t, rd + 2 * V, Ld(ref o, wo + 2 * V)); St(ref t, rd + 3 * V, Ld(ref o, wo + 3 * V));
+                }
+            }
+            int copied = inLoop ? (i - 1) / 2 + 1 : 0;
+            int oi = Q * i;
+            St(ref o, oi, c0); St(ref o, oi + V, c1); St(ref o, oi + 2 * V, c2); St(ref o, oi + 3 * V, c3);
+
+            // Last output row straight into the tile, as in idwt53_v_cas0_mcols2: its input (row sn + dn - 1) is in
+            // s0..s3 by now and the even-length tail only reads row len / 2 - 1 < len - 1.
+            int ol = (len - 1) * stride, ol2 = Q * (len - 2);
+            if ((len & 1) == 0)
+            {
+                int rl = (len / 2 - 1) * stride;
+                var dn = Ld(ref t, rl) - ((s0 + s0 + two) >> 2);
+                St(ref o, ol2, s0 + ((dn + c0) >> 1)); St(ref t, ol, dn);
+                dn = Ld(ref t, rl + V) - ((s1 + s1 + two) >> 2);
+                St(ref o, ol2 + V, s1 + ((dn + c1) >> 1)); St(ref t, ol + V, dn);
+                dn = Ld(ref t, rl + 2 * V) - ((s2 + s2 + two) >> 2);
+                St(ref o, ol2 + 2 * V, s2 + ((dn + c2) >> 1)); St(ref t, ol + 2 * V, dn);
+                dn = Ld(ref t, rl + 3 * V) - ((s3 + s3 + two) >> 2);
+                St(ref o, ol2 + 3 * V, s3 + ((dn + c3) >> 1)); St(ref t, ol + 3 * V, dn);
+            }
+            else
+            {
+                St(ref t, ol, s0 + c0); St(ref t, ol + V, s1 + c1); St(ref t, ol + 2 * V, s2 + c2); St(ref t, ol + 3 * V, s3 + c3);
+            }
+
+            for (int r = copied, dst = copied * stride, src = copied * Q; r < len - 1; r++, dst += stride, src += Q)
+            {
+                St(ref t, dst, Ld(ref o, src)); St(ref t, dst + V, Ld(ref o, src + V));
+                St(ref t, dst + 2 * V, Ld(ref o, src + 2 * V)); St(ref t, dst + 3 * V, Ld(ref o, src + 3 * V));
+            }
+        }
+
+        /// <summary>
         /// Vertical inverse 5x3 transform of PARALLEL_COLS_53 columns, top-most pixel on an even coordinate.
         /// </summary>
         /// <remarks>
         /// 2.5.4 - opj_idwt53_v_cas0_mcols_SIMD. Integer only, so identical to idwt3_v_cas0 per column.
-        /// Each Vector&lt;int&gt;-wide group of columns is processed top to bottom in turn.
+        /// With two vectors per 16 columns (AVX2) both halves share one sweep over the rows; otherwise each
+        /// Vector&lt;int&gt;-wide group of columns is processed top to bottom in turn.
         /// </remarks>
+        // Fully optimised from the first call: under tiering this loop otherwise ran as OSR code for whole decodes.
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static void idwt53_v_cas0_mcols(int[] tmp, int sn, int len, int[] tiled, int tiledp_col, int stride)
         {
             const int P = (int)PARALLEL_COLS_53;
             int V = Vector<int>.Count;
             var two = new Vector<int>(2);
             Debug.Assert(len > 1);
+
+            if (2 * V == P && ColumnsInRange(tmp, len, tiled, tiledp_col, stride))
+            {
+                // Both 8-column halves in one sweep over the rows, as upstream's AVX2 code does (full cache lines,
+                // one page walk per row); unchecked accesses, rows 0 .. len - 1 checked above.
+                ref int t = ref tiled[tiledp_col];
+                ref int o = ref tmp[0];
+                int od = sn * stride;
+                var s1na = Ld(ref t, 0); var s1nb = Ld(ref t, V);
+                var d1na = Ld(ref t, od); var d1nb = Ld(ref t, od + V);
+                var s0na = s1na - ((d1na + d1na + two) >> 2);
+                var s0nb = s1nb - ((d1nb + d1nb + two) >> 2);
+
+                int i = 0, re = stride, ro = od + stride, copied = 0;
+                if ((stride & 127) != 0)
+                {
+                    // Step k (i = 2k) reads tile rows k + 1 and sn + k + 1; each row is read once. Output row k + 1 is
+                    // in tmp by then, so it is written into the tile row just read, while the line is in L1; a separate
+                    // copy-back pass afterwards misses on most rows of a tall strip. Row 0 (output s0n) goes in first;
+                    // the rows left are copied back after the loop. Not in upstream.
+                    // Only when rows with the same address bits 0-11 are 16 or more rows apart: with a stride of a
+                    // multiple of 128 ints, a store to row r falsely delays the loads of rows r + 4 (4K aliasing), and
+                    // the separate copy-back was faster (256x256 tiles: +7%; 2496-wide tile: -11%).
+                    St(ref t, 0, s0na); St(ref t, V, s0nb);
+                    for (int wo = P; i < len - 3; i += 2, re += stride, ro += stride, wo += P)
+                    {
+                        var d1ca = d1na; var d1cb = d1nb;
+                        var s0ca = s0na; var s0cb = s0nb;
+                        s1na = Ld(ref t, re); s1nb = Ld(ref t, re + V);
+                        d1na = Ld(ref t, ro); d1nb = Ld(ref t, ro + V);
+                        s0na = s1na - ((d1ca + d1na + two) >> 2);
+                        s0nb = s1nb - ((d1cb + d1nb + two) >> 2);
+                        St(ref o, P * i, s0ca); St(ref o, P * i + V, s0cb);
+                        St(ref o, P * (i + 1), d1ca + ((s0ca + s0na) >> 1));
+                        St(ref o, P * (i + 1) + V, d1cb + ((s0cb + s0nb) >> 1));
+                        St(ref t, re, Ld(ref o, wo)); St(ref t, re + V, Ld(ref o, wo + V));
+                    }
+                    copied = i / 2 + 1;
+                }
+                else
+                {
+                    for (; i < len - 3; i += 2, re += stride, ro += stride)
+                    {
+                        var d1ca = d1na; var d1cb = d1nb;
+                        var s0ca = s0na; var s0cb = s0nb;
+                        s1na = Ld(ref t, re); s1nb = Ld(ref t, re + V);
+                        d1na = Ld(ref t, ro); d1nb = Ld(ref t, ro + V);
+                        s0na = s1na - ((d1ca + d1na + two) >> 2);
+                        s0nb = s1nb - ((d1cb + d1nb + two) >> 2);
+                        St(ref o, P * i, s0ca); St(ref o, P * i + V, s0cb);
+                        St(ref o, P * (i + 1), d1ca + ((s0ca + s0na) >> 1));
+                        St(ref o, P * (i + 1) + V, d1cb + ((s0cb + s0nb) >> 1));
+                    }
+                }
+                St(ref o, P * i, s0na); St(ref o, P * i + V, s0nb);
+
+                if ((len & 1) != 0)
+                {
+                    int rl = ((len - 1) / 2) * stride;
+                    var lasta = Ld(ref t, rl) - ((d1na + d1na + two) >> 2);
+                    var lastb = Ld(ref t, rl + V) - ((d1nb + d1nb + two) >> 2);
+                    St(ref o, P * (len - 1), lasta); St(ref o, P * (len - 1) + V, lastb);
+                    St(ref o, P * (len - 2), d1na + ((s0na + lasta) >> 1));
+                    St(ref o, P * (len - 2) + V, d1nb + ((s0nb + lastb) >> 1));
+                }
+                else
+                {
+                    St(ref o, P * (len - 1), d1na + s0na); St(ref o, P * (len - 1) + V, d1nb + s0nb);
+                }
+                CopyColumnsBackUnchecked(tmp, copied, len, tiled, tiledp_col, stride);
+                return;
+            }
 
             for (int c = 0; c < P; c += V)
             {
@@ -3070,20 +3860,166 @@ namespace OpenJpeg.Internal
                 }
             }
 
-            for (int i = 0; i < len; ++i)
-                Array.Copy(tmp, P * i, tiled, tiledp_col + i * stride, P);
+            CopyColumnsBack(tmp, len, tiled, tiledp_col, stride);
         }
+
+#if NET8_0_OR_GREATER
+        /// <summary>
+        /// Vector512 version of <see cref="idwt53_v_cas0_mcols"/>: all 16 columns in one register
+        /// (upstream's __AVX512F__ build does 32 columns with two registers).
+        /// </summary>
+        private static void idwt53_v_cas0_mcols512(int[] tmp, int sn, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            ReadOnlySpan<int> t = tiled;
+            Span<int> o = tmp;
+            var two = Vector512.Create(2);
+            int in_even = tiledp_col;
+            int in_odd = tiledp_col + sn * stride;
+
+            var s1n = Vector512.Create(t.Slice(in_even, P));
+            var d1n = Vector512.Create(t.Slice(in_odd, P));
+            var s0n = s1n - ((d1n + d1n + two) >> 2);
+
+            int i = 0, j = 1;
+            for (; i < len - 3; i += 2, j++)
+            {
+                var d1c = d1n;
+                var s0c = s0n;
+                s1n = Vector512.Create(t.Slice(in_even + j * stride, P));
+                d1n = Vector512.Create(t.Slice(in_odd + j * stride, P));
+                s0n = s1n - ((d1c + d1n + two) >> 2);
+                s0c.CopyTo(o.Slice(P * i));
+                (d1c + ((s0c + s0n) >> 1)).CopyTo(o.Slice(P * (i + 1)));
+            }
+            s0n.CopyTo(o.Slice(P * i));
+
+            if ((len & 1) != 0)
+            {
+                s1n = Vector512.Create(t.Slice(in_even + ((len - 1) / 2) * stride, P));
+                var last = s1n - ((d1n + d1n + two) >> 2);
+                last.CopyTo(o.Slice(P * (len - 1)));
+                (d1n + ((s0n + last) >> 1)).CopyTo(o.Slice(P * (len - 2)));
+            }
+            else
+            {
+                (d1n + s0n).CopyTo(o.Slice(P * (len - 1)));
+            }
+
+            CopyColumnsBack(tmp, len, tiled, tiledp_col, stride);
+        }
+
+        /// <summary>Vector512 version of <see cref="idwt53_v_cas1_mcols"/>.</summary>
+        private static void idwt53_v_cas1_mcols512(int[] tmp, int sn, int len, int[] tiled, int tiledp_col, int stride)
+        {
+            const int P = (int)PARALLEL_COLS_53;
+            ReadOnlySpan<int> t = tiled;
+            Span<int> o = tmp;
+            var two = Vector512.Create(2);
+            int in_even = tiledp_col + sn * stride;
+            int in_odd = tiledp_col;
+
+            var s1 = Vector512.Create(t.Slice(in_even + stride, P));
+            var e0 = Vector512.Create(t.Slice(in_even, P));
+            var dc = Vector512.Create(t.Slice(in_odd, P)) - ((e0 + s1 + two) >> 2);
+            (e0 + dc).CopyTo(o);
+
+            int i = 1, j = 1;
+            int end = len - 2 - ((len & 1) == 0 ? 1 : 0);
+            for (; i < end; i += 2, j++)
+            {
+                var s2 = Vector512.Create(t.Slice(in_even + (j + 1) * stride, P));
+                var dn = Vector512.Create(t.Slice(in_odd + j * stride, P)) - ((s1 + s2 + two) >> 2);
+                dc.CopyTo(o.Slice(P * i));
+                (s1 + ((dn + dc) >> 1)).CopyTo(o.Slice(P * (i + 1)));
+                dc = dn;
+                s1 = s2;
+            }
+            dc.CopyTo(o.Slice(P * i));
+
+            if ((len & 1) == 0)
+            {
+                var dn = Vector512.Create(t.Slice(in_odd + (len / 2 - 1) * stride, P)) - ((s1 + s1 + two) >> 2);
+                (s1 + ((dn + dc) >> 1)).CopyTo(o.Slice(P * (len - 2)));
+                dn.CopyTo(o.Slice(P * (len - 1)));
+            }
+            else
+            {
+                (s1 + dc).CopyTo(o.Slice(P * (len - 1)));
+            }
+
+            CopyColumnsBack(tmp, len, tiled, tiledp_col, stride);
+        }
+#endif
 
         /// <summary>
         /// Vertical inverse 5x3 transform of PARALLEL_COLS_53 columns, top-most pixel on an odd coordinate.
         /// </summary>
         /// <remarks>2.5.4 - opj_idwt53_v_cas1_mcols_SIMD. Integer only, so identical to idwt3_v_cas1 per column.</remarks>
+        // Fully optimised from the first call: under tiering this loop otherwise ran as OSR code for whole decodes.
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static void idwt53_v_cas1_mcols(int[] tmp, int sn, int len, int[] tiled, int tiledp_col, int stride)
         {
             const int P = (int)PARALLEL_COLS_53;
             int V = Vector<int>.Count;
             var two = new Vector<int>(2);
             Debug.Assert(len > 2);
+
+            if (2 * V == P && ColumnsInRange(tmp, len, tiled, tiledp_col, stride))
+            {
+                // One sweep for both halves, unchecked; see idwt53_v_cas0_mcols.
+                ref int t = ref tiled[tiledp_col];
+                ref int o = ref tmp[0];
+                int ev = sn * stride;
+                var s1a = Ld(ref t, ev + stride); var s1b = Ld(ref t, ev + stride + V);
+                var e0a = Ld(ref t, ev); var e0b = Ld(ref t, ev + V);
+                var dca = Ld(ref t, 0) - ((e0a + s1a + two) >> 2);
+                var dcb = Ld(ref t, V) - ((e0b + s1b + two) >> 2);
+                St(ref o, 0, e0a + dca); St(ref o, V, e0b + dcb);
+
+                // Step j (i = 2j - 1) reads tile rows j and sn + j + 1, each once; with the same stride condition as
+                // idwt53_v_cas0_mcols, output row j is written into tile row j right after it is read. Not in upstream.
+                bool inLoop = (stride & 127) != 0;
+                if (inLoop)
+                {
+                    St(ref t, 0, e0a + dca); St(ref t, V, e0b + dcb);
+                }
+                int i = 1, rs2 = ev + 2 * stride, rd = stride, wo = P;
+                int end = len - 2 - ((len & 1) == 0 ? 1 : 0);
+                for (; i < end; i += 2, rs2 += stride, rd += stride, wo += P)
+                {
+                    var s2a = Ld(ref t, rs2); var s2b = Ld(ref t, rs2 + V);
+                    var dna = Ld(ref t, rd) - ((s1a + s2a + two) >> 2);
+                    var dnb = Ld(ref t, rd + V) - ((s1b + s2b + two) >> 2);
+                    St(ref o, P * i, dca); St(ref o, P * i + V, dcb);
+                    St(ref o, P * (i + 1), s1a + ((dna + dca) >> 1));
+                    St(ref o, P * (i + 1) + V, s1b + ((dnb + dcb) >> 1));
+                    dca = dna; dcb = dnb;
+                    s1a = s2a; s1b = s2b;
+                    if (inLoop)
+                    {
+                        St(ref t, rd, Ld(ref o, wo)); St(ref t, rd + V, Ld(ref o, wo + V));
+                    }
+                }
+                int copied = inLoop ? (i - 1) / 2 + 1 : 0;
+                St(ref o, P * i, dca); St(ref o, P * i + V, dcb);
+
+                if ((len & 1) == 0)
+                {
+                    int rl = (len / 2 - 1) * stride;
+                    var dna = Ld(ref t, rl) - ((s1a + s1a + two) >> 2);
+                    var dnb = Ld(ref t, rl + V) - ((s1b + s1b + two) >> 2);
+                    St(ref o, P * (len - 2), s1a + ((dna + dca) >> 1));
+                    St(ref o, P * (len - 2) + V, s1b + ((dnb + dcb) >> 1));
+                    St(ref o, P * (len - 1), dna); St(ref o, P * (len - 1) + V, dnb);
+                }
+                else
+                {
+                    St(ref o, P * (len - 1), s1a + dca); St(ref o, P * (len - 1) + V, s1b + dcb);
+                }
+                CopyColumnsBackUnchecked(tmp, copied, len, tiled, tiledp_col, stride);
+                return;
+            }
 
             for (int c = 0; c < P; c += V)
             {
@@ -3121,23 +4057,13 @@ namespace OpenJpeg.Internal
                 }
             }
 
-            for (int i = 0; i < len; ++i)
-                Array.Copy(tmp, P * i, tiled, tiledp_col + i * stride, P);
+            CopyColumnsBack(tmp, len, tiled, tiledp_col, stride);
         }
 #endif
 
         //2.5
         private static void idwt53_v(dwt_local dwt, int[] tiled, int tiledp_col, int stride, int nb_cols)
         {
-#if STANDARD_SLOW_VERSION
-            for (int c = 0; c < nb_cols; c ++) {
-                Interleave_v(dwt, tiledp_col + c, tiled, stride);
-                Decode_1(dwt);
-                for (int k = 0; k < dwt.sn + dwt.dn; ++k) {
-                    tiled[tiledp_col + c + k * stride] = dwt.mem[k];
-                }
-            }
-#else
             //var mem_copy = new int[dwt.mem.Length];
             //Array.Copy(dwt.mem, mem_copy, dwt.mem.Length);
             //var tiled_copy = new int[tiled.Length];
@@ -3162,6 +4088,13 @@ namespace OpenJpeg.Internal
             if (dwt.cas == 0)
             {
 #if NET7_0_OR_GREATER
+#if NET8_0_OR_GREATER
+                if (Simd.Use512 && len > 1 && nb_cols == PARALLEL_COLS_53)
+                {
+                    idwt53_v_cas0_mcols512(dwt.mem, sn, len, tiled, tiledp_col, stride);
+                    return;
+                }
+#endif
                 if (UseVectors53 && len > 1 && nb_cols == PARALLEL_COLS_53)
                 {
                     idwt53_v_cas0_mcols(dwt.mem, sn, len, tiled, tiledp_col, stride);
@@ -3218,6 +4151,13 @@ namespace OpenJpeg.Internal
                 }
 
 #if NET7_0_OR_GREATER
+#if NET8_0_OR_GREATER
+                if (Simd.Use512 && len > 2 && nb_cols == PARALLEL_COLS_53)
+                {
+                    idwt53_v_cas1_mcols512(dwt.mem, sn, len, tiled, tiledp_col, stride);
+                    return;
+                }
+#endif
                 if (UseVectors53 && len > 2 && nb_cols == PARALLEL_COLS_53)
                 {
                     idwt53_v_cas1_mcols(dwt.mem, sn, len, tiled, tiledp_col, stride);
@@ -3233,7 +4173,6 @@ namespace OpenJpeg.Internal
                     return;
                 }
             }
-#endif
         }
 
         /// <summary>

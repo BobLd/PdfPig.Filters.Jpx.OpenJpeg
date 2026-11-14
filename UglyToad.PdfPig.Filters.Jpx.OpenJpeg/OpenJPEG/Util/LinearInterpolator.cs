@@ -11,18 +11,12 @@ namespace OpenJpeg.Util
     /// </remarks>
     internal class LinearInterpolator
     {
-        #region Variables and properties
-
         /***
          * Used to transform X from window til viewport.
          */
         readonly double MAPPING_U;
 
         readonly double _y_min, _x_min;
-
-        #endregion
-
-        #region Init
 
         /// <summary>
         /// Maps from x_min/x_max to y_min/y_max
@@ -43,8 +37,6 @@ namespace OpenJpeg.Util
             _x_min = x_min;
             _y_min = y_min;
         }
-
-        #endregion
 
         /// <summary>
         /// Reverses an interpolation

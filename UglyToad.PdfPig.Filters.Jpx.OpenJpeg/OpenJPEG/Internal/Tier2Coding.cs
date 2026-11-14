@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -29,7 +28,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System;
 using System.Diagnostics;
 
@@ -52,8 +51,6 @@ namespace OpenJpeg.Internal
     /// <remarks>t2.c</remarks>
     internal sealed class Tier2Coding
     {
-        #region Variables and properties
-
         /// <summary>
         /// Encoding: pointer to the src image. 
         /// Decoding: pointer to the dst image.
@@ -71,10 +68,6 @@ namespace OpenJpeg.Internal
         /// <remarks>Not needed for encode</remarks>
         readonly CompressionInfo _cinfo;
 
-        #endregion
-
-        #region Init
-
         //2.5 - opj_t2_create
         internal Tier2Coding(CompressionInfo cinfo, JPXImage image, CodingParameters cp)
         {
@@ -82,8 +75,6 @@ namespace OpenJpeg.Internal
             _image = image;
             _cinfo = cinfo;
         }
-
-        #endregion
 
         /// <summary>
         /// Docodes packets for a tile
@@ -984,11 +975,7 @@ namespace OpenJpeg.Internal
             TcdTilecomp tilec = tile.comps[compno];
             TcdResolution res = tilec.resolutions[resno];
 
-#if ENABLE_EMPTY_PACKET_OPTIMIZATION
-            bool packet_empty = true;
-#else
             const bool packet_empty = false;
-#endif
 
             //Writes out SOP 0xff91
             if ((tcp.csty & CP_CSTY.SOP) != 0)
@@ -1038,35 +1025,6 @@ namespace OpenJpeg.Internal
                     }
                 }
             }
-
-#if ENABLE_EMPTY_PACKET_OPTIMIZATION
-            // WARNING: this code branch is disabled, since it has been reported that
-            //          such packets cause decoding issues with cinema J2K hardware
-
-            // Check if the packet is empty
-            for (int bandno = 0; bandno < res.numbands; bandno++)
-            {
-                TcdBand band = res.bands[bandno];
-                if (band.IsEmpty)
-                    continue;
-
-                TcdPrecinct prc = band.precincts[precno];
-                uint n_blocks = prc.cw * prc.ch;
-                for (int cblkno = 0; cblkno < n_blocks; cblkno++)
-                {
-                    TcdCblkEnc cblk = prc.enc[cblkno];
-                    TcdLayer layer = cblk.layers[layno];
-
-                    if (layer.numpasses == 0)
-                        continue;
-
-                    packet_empty = false;
-                    break;
-                }
-                if (!packet_empty)
-                    break;
-            }
-#endif
 
             //Sets up a bit writer.
             //C# this method is the only method that uses this bitwriter. It was

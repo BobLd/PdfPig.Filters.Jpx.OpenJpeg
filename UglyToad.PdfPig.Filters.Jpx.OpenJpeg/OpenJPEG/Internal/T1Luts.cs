@@ -1,8 +1,8 @@
-namespace OpenJpeg.Internal
+﻿namespace OpenJpeg.Internal
 {
     internal static class T1Luts
     {
-        static short[] lut_nmsedec_ref = {
+        static readonly short[] lut_nmsedec_ref = {
           0x1800, 0x1780, 0x1700, 0x1680, 0x1600, 0x1580, 0x1500, 0x1480, 
           0x1400, 0x1380, 0x1300, 0x1280, 0x1200, 0x1180, 0x1100, 0x1080, 
           0x1000, 0x0f80, 0x0f00, 0x0e80, 0x0e00, 0x0d80, 0x0d00, 0x0c80, 
@@ -21,7 +21,7 @@ namespace OpenJpeg.Internal
           0x1400, 0x1480, 0x1500, 0x1580, 0x1600, 0x1680, 0x1700, 0x1780
         };
 
-        static short[] lut_nmsedec_ref0 = {
+        static readonly short[] lut_nmsedec_ref0 = {
           0x2000, 0x1f00, 0x1e00, 0x1d00, 0x1c00, 0x1b00, 0x1a80, 0x1980, 
           0x1880, 0x1780, 0x1700, 0x1600, 0x1500, 0x1480, 0x1380, 0x1300, 
           0x1200, 0x1180, 0x1080, 0x1000, 0x0f00, 0x0e80, 0x0e00, 0x0d00, 
@@ -51,7 +51,7 @@ namespace OpenJpeg.Internal
             return lut_nmsedec_ref0[x & ((1 << Constants.T1_NMSEDEC_BITS) - 1)];
         }
 
-        static short[] lut_nmsedec_sig = {
+        static readonly short[] lut_nmsedec_sig = {
           0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
           0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
           0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 
@@ -70,7 +70,7 @@ namespace OpenJpeg.Internal
           0x6c00, 0x6d80, 0x6f00, 0x7080, 0x7200, 0x7380, 0x7500, 0x7680
         };
 
-        static short[] lut_nmsedec_sig0 = {
+        static readonly short[] lut_nmsedec_sig0 = {
           0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0080, 0x0080, 
           0x0080, 0x0080, 0x0100, 0x0100, 0x0100, 0x0180, 0x0180, 0x0200, 
           0x0200, 0x0280, 0x0280, 0x0300, 0x0300, 0x0380, 0x0400, 0x0400, 
@@ -134,7 +134,7 @@ namespace OpenJpeg.Internal
         }
 
         //2.5 - lut_ctxno_zc[2048]
-        internal static sbyte[] lut_ctxno_zc = {
+        internal static readonly sbyte[] lut_ctxno_zc = {
             0, 1, 3, 3, 1, 2, 3, 3, 5, 6, 7, 7, 6, 6, 7, 7, 0, 1, 3, 3, 1, 2, 3, 3, 5, 6, 7, 7, 6, 6, 7, 7,
             5, 6, 7, 7, 6, 6, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 5, 6, 7, 7, 6, 6, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8,
             1, 2, 3, 3, 2, 2, 3, 3, 6, 6, 7, 7, 6, 6, 7, 7, 1, 2, 3, 3, 2, 2, 3, 3, 6, 6, 7, 7, 6, 6, 7, 7,
@@ -202,7 +202,7 @@ namespace OpenJpeg.Internal
         };
 
         //2.5 - lut_spb
-        static bool[] lut_spb = 
+        static readonly bool[] lut_spb = 
         {
             false, false, false, false, false, false, false, false, false, true, false, true, false, true, false, true, false, false, true, true, false, false, true, true, false, true, false, true, false, true, false, true,
             false, false, false, false, true, true, true, true, false, false, false, false, false, true, false, true, false, false, false, false, true, true, true, true, false, false, false, true, false, true, true, true,
@@ -215,6 +215,13 @@ namespace OpenJpeg.Internal
         };
 
         //2.5 - opj_t1_getspb
+        /// <summary>opj_t1_getctxno_zc: orient is (band orientation &lt;&lt; 9), see MQCoder.lut_ctxno_zc_orient.</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        internal static byte Getctxno_zc(int orient, T1 f)
+        {
+            return (byte)lut_ctxno_zc[orient + (int)(f & T1.SIGMA_NEIGHBOURS)];
+        }
+
         internal static bool Getspb(T1 f)
         {
             return lut_spb[(uint)f];
@@ -222,7 +229,7 @@ namespace OpenJpeg.Internal
 
         //2.5 - lut_ctxno_sc[256]
         //This table corresponds with the enum "T1_CTXNO"
-        static sbyte[] ctxno_sc = 
+        static readonly sbyte[] ctxno_sc = 
         {
             0x9, 0x9, 0xa, 0xa, 0x9, 0x9, 0xa, 0xa, 0xc, 0xc, 0xd, 0xb, 0xc, 0xc, 0xd, 0xb,
             0x9, 0x9, 0xa, 0xa, 0x9, 0x9, 0xa, 0xa, 0xc, 0xc, 0xb, 0xd, 0xc, 0xc, 0xb, 0xd,
@@ -257,11 +264,14 @@ namespace OpenJpeg.Internal
         /// 
         /// I assume "mag" means Magnitude Refinement
         /// </remarks>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         internal static uint Getctxno_mag(T1 f)
         {
-            uint tmp1 = ((f & T1.SIGMA_NEIGHBOURS) != 0) ? (uint) T1_CTXNO.MAG + 1 : (uint) T1_CTXNO.MAG;
-            uint tmp2 = ((f & T1.MU_0) != 0) ? (uint) T1_CTXNO.MAG + 2 : tmp1;
-            return (tmp2);
+            // Branch-free form of: MU_0 ? MAG + 2 : (any neighbour significant ? MAG + 1 : MAG).
+            // The flags are data-dependent, so the branchy version mispredicts.
+            uint nb = ((uint)(f & T1.SIGMA_NEIGHBOURS) + 0x7FFFFFFFu) >> 31; // 1 if any neighbour bit is set
+            uint mu = ((uint)(f & T1.MU_0) >> 20) & 1u;
+            return (uint)T1_CTXNO.MAG + ((nb | (mu << 1)) - (mu & nb));
         }
 
     }

@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,7 +29,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System.IO;
 using System.Diagnostics;
 using OpenJpeg.Internal;
@@ -50,8 +49,6 @@ namespace OpenJpeg
     /// </remarks>
     internal sealed class JP2
     {
-        #region Variables and properties
-
         /// <summary>
         /// The parent compression info obj.
         /// </summary>
@@ -127,10 +124,6 @@ namespace OpenJpeg
 
         bool _has_ihdr;
         bool _has_jp2h { get { return (_state & JP2_STATE.HEADER) != 0; } }
-
-        #endregion
-
-        #region Init
 
         internal JP2(CompressionInfo cinfo, J2K j2k)
         {
@@ -322,8 +315,6 @@ namespace OpenJpeg
             // This is a C# addition.
             _color.ignore_cmap = parameters.IgnoreColorLookupTable;
         }
-
-        #endregion
 
         //2.5.1 - opj_jp2_read_header
         internal bool ReadHeader(out JPXImage image)

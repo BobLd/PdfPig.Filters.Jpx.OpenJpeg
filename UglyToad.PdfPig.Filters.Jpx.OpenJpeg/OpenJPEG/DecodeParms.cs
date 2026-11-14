@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,11 +29,9 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
-#region Using
+
 using System;
 using OPJ_UINT32 = System.Int32;
-#endregion
 
 namespace OpenJpeg
 {
@@ -43,8 +40,6 @@ namespace OpenJpeg
     /// </summary>
     internal struct DecodeParms
     {
-        #region Variables and properties
-
         /// <summary>
         /// Set the number of highest resolution levels to be discarded. 
 	    /// The image resolution is effectively divided by 2 to the power of the number of discarded levels. 
@@ -69,12 +64,6 @@ namespace OpenJpeg
 	    /// if == LIMIT_TO_MAIN_HEADER, only the main header is decoded; 
         /// </summary>
         //public LimitDecoding LimitDecoding = LimitDecoding.NO_LIMITATION;
-
-        #endregion
-
-        #region Init
-
-        #endregion
     }
 
     //2.1
@@ -131,7 +120,7 @@ namespace OpenJpeg
             //OPJ_DPARAMETERS_IGNORE_PCLR_CMAP_CDEF_FLAG  
             IGNORE_PCLR_CMAP_CDEF_FLAG = 1,
             /// <summary>
-            /// Has to be compiled with SUPPORT_DUMP_FLAG to take effect
+            /// Not supported: has no effect (upstream's opj_dump reads the headers only with it)
             /// </summary>
             /// <remarks>OPJ_DPARAMETERS_DUMP_FLAG</remarks>
             DUMP_FLAG = 2

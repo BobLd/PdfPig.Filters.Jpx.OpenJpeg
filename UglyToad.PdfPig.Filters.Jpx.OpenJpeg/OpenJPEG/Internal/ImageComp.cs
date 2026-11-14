@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,18 +29,14 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
-#region Using
+
 using System;
 using OPJ_UINT32 = System.UInt32;
-#endregion
 
 namespace OpenJpeg.Internal
 {
     public class ImageComp : ICloneable
     {
-        #region Variables and properties
-
         /// <summary>
         /// XRsiz: horizontal separation of a sample of this component with respect to the reference grid
         /// </summary>
@@ -155,10 +150,6 @@ namespace OpenJpeg.Internal
         /// </summary>
         public uint DY => dy;
 
-        #endregion
-
-        #region Init
-
         internal ImageComp() {}
 
         /// <summary>
@@ -184,13 +175,7 @@ namespace OpenJpeg.Internal
             this.data = data;
         }
 
-        #endregion
-
-        #region ICloneable
-
         public object Clone() { return MemberwiseClone(); }
-
-        #endregion
 
         /// <summary>
         /// Makes this a 1bpp channel

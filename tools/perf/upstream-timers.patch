@@ -1,0 +1,148 @@
+diff --git a/src/lib/openjp2/dwt.c b/src/lib/openjp2/dwt.c
+index 4c2c6a43..0fe059e5 100644
+--- a/src/lib/openjp2/dwt.c
++++ b/src/lib/openjp2/dwt.c
+@@ -43,6 +43,29 @@
+ #define OPJ_SKIP_POISON
+ #include "opj_includes.h"
+ 
++/* Stage timers for tools/perf/upstream.ps1 (jpx-perf patch, not upstream code): totals in ms, printed to
++   stderr at exit as "perf <stage> <ms>". Single-threaded decoding only. */
++#include <time.h>
++static double opj_perf_now(void)
++{
++    struct timespec ts;
++    timespec_get(&ts, TIME_UTC);
++    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
++}
++static double opj_perf_dwt[8];
++static int opj_perf_dwt_reg;
++static void opj_perf_dwt_dump(void)
++{
++    static const char* const names[8] = { "53 horizontal", "53 vertical", "97 h-interleave", "97 h-lifting", "97 h-writeback", "97 v-interleave", "97 v-lifting", "97 v-writeback" };
++    int i;
++    for (i = 0; i < 8; i++) {
++        if (opj_perf_dwt[i] != 0) {
++            fprintf(stderr, "perf %s %.3f\n", names[i], opj_perf_dwt[i]);
++        }
++    }
++}
++#define OPJ_PERF(k, stmt) { double _pt = opj_perf_now(); if (!opj_perf_dwt_reg) { opj_perf_dwt_reg = 1; atexit(opj_perf_dwt_dump); } stmt; opj_perf_dwt[k] += opj_perf_now() - _pt; }
++
+ #ifdef __SSE__
+ #include <xmmintrin.h>
+ #endif
+@@ -2345,9 +2368,11 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
+         h.cas = tr->x0 % 2;
+ 
+         if (num_threads <= 1 || rh <= 1) {
++            OPJ_PERF(0,
+             for (j = 0; j < rh; ++j) {
+                 opj_idwt53_h(&h, &tiledp[(OPJ_SIZE_T)j * w]);
+             }
++            )
+         } else {
+             OPJ_UINT32 num_jobs = (OPJ_UINT32)num_threads;
+             OPJ_UINT32 step_j;
+@@ -2396,6 +2421,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
+         v.cas = tr->y0 % 2;
+ 
+         if (num_threads <= 1 || rw <= 1) {
++            OPJ_PERF(1,
+             for (j = 0; j + PARALLEL_COLS_53 <= rw;
+                     j += PARALLEL_COLS_53) {
+                 opj_idwt53_v(&v, &tiledp[j], (OPJ_SIZE_T)w, PARALLEL_COLS_53);
+@@ -2403,6 +2429,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
+             if (j < rw) {
+                 opj_idwt53_v(&v, &tiledp[j], (OPJ_SIZE_T)w, (OPJ_INT32)(rw - j));
+             }
++            )
+         } else {
+             OPJ_UINT32 num_jobs = (OPJ_UINT32)num_threads;
+             OPJ_UINT32 step_j;
+@@ -3673,9 +3700,10 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
+         if (num_threads <= 1 || rh < 2 * NB_ELTS_V8) {
+             for (j = 0; j + (NB_ELTS_V8 - 1) < rh; j += NB_ELTS_V8) {
+                 OPJ_UINT32 k;
+-                opj_v8dwt_interleave_h(&h, aj, w, NB_ELTS_V8);
+-                opj_v8dwt_decode(&h);
++                OPJ_PERF(2, opj_v8dwt_interleave_h(&h, aj, w, NB_ELTS_V8));
++                OPJ_PERF(3, opj_v8dwt_decode(&h));
+ 
++                OPJ_PERF(4,
+                 /* To be adapted if NB_ELTS_V8 changes */
+                 for (k = 0; k < rw; k++) {
+                     aj[k      ] = h.wavelet[k].f[0];
+@@ -3689,6 +3717,7 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
+                     aj[k + (OPJ_SIZE_T)w * 6] = h.wavelet[k].f[6];
+                     aj[k + (OPJ_SIZE_T)w * 7] = h.wavelet[k].f[7];
+                 }
++                )
+ 
+                 aj += w * NB_ELTS_V8;
+             }
+@@ -3759,12 +3788,14 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
+             for (j = rw; j > (NB_ELTS_V8 - 1); j -= NB_ELTS_V8) {
+                 OPJ_UINT32 k;
+ 
+-                opj_v8dwt_interleave_v(&v, aj, w, NB_ELTS_V8);
+-                opj_v8dwt_decode(&v);
++                OPJ_PERF(5, opj_v8dwt_interleave_v(&v, aj, w, NB_ELTS_V8));
++                OPJ_PERF(6, opj_v8dwt_decode(&v));
+ 
++                OPJ_PERF(7,
+                 for (k = 0; k < rh; ++k) {
+                     memcpy(&aj[k * (OPJ_SIZE_T)w], &v.wavelet[k], NB_ELTS_V8 * sizeof(OPJ_FLOAT32));
+                 }
++                )
+                 aj += NB_ELTS_V8;
+             }
+         } else {
+diff --git a/src/lib/openjp2/t1.c b/src/lib/openjp2/t1.c
+index 98dce47f..113e30a1 100644
+--- a/src/lib/openjp2/t1.c
++++ b/src/lib/openjp2/t1.c
+@@ -41,6 +41,23 @@
+ #define OPJ_SKIP_POISON
+ #include "opj_includes.h"
+ 
++/* Stage timers for tools/perf/upstream.ps1 (jpx-perf patch, not upstream code): totals in ms, printed to
++   stderr at exit as "perf <stage> <ms>". Single-threaded decoding only. */
++#include <time.h>
++static double opj_perf_now(void)
++{
++    struct timespec ts;
++    timespec_get(&ts, TIME_UTC);
++    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
++}
++static double opj_perf_t1[3];
++static int opj_perf_t1_reg;
++static void opj_perf_t1_dump(void)
++{
++    fprintf(stderr, "perf sigpass %.3f\nperf refpass %.3f\nperf clnpass %.3f\n",
++            opj_perf_t1[0], opj_perf_t1[1], opj_perf_t1[2]);
++}
++
+ #ifdef __SSE__
+ #include <xmmintrin.h>
+ #endif
+@@ -2114,6 +2131,11 @@ static OPJ_BOOL opj_t1_decode_cblk(opj_t1_t *t1,
+ 
+         for (passno = 0; (passno < seg->real_num_passes) &&
+                 (bpno_plus_one >= 1); ++passno) {
++            double _pp = opj_perf_now();
++            if (!opj_perf_t1_reg) {
++                opj_perf_t1_reg = 1;
++                atexit(opj_perf_t1_dump);
++            }
+             switch (passtype) {
+             case 0:
+                 if (type == T1_TYPE_RAW) {
+@@ -2134,6 +2156,7 @@ static OPJ_BOOL opj_t1_decode_cblk(opj_t1_t *t1,
+                 break;
+             }
+ 
++            opj_perf_t1[passtype] += opj_perf_now() - _pp;
+             if ((cblksty & J2K_CCP_CBLKSTY_RESET) && type == T1_TYPE_MQ) {
+                 opj_mqc_resetstates(mqc);
+                 opj_mqc_setstate(mqc, T1_CTXNO_UNI, 0, 46);

@@ -149,21 +149,11 @@
         /// Assumes complement-to-two signed integers.
         /// </summary>
         /// <returns>a + b</returns>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         public static int int_add_no_overflow(int a, int b)
         {
-            //C# original impl does a lot of pointer magic, to avoid casting the
-            //   org. values. I'm unsure how to do this, going with an ugly hack
-            //   for now.
-            var pa = new IntOrUInt();
-            var pb = new IntOrUInt();
-            pa.I = a;
-            pb.I = b;
-            uint ures = pa.U + pb.U;
-            pa.U = ures;
-            return pa.I;
-
-            //TODO: Test if this can replace the code above
-            //return (int)((uint)a + (uint)b);
+            // C# int arithmetic wraps (unchecked by default), exactly like the uint version upstream.
+            return unchecked(a + b);
         }
 
         /// <summary>
@@ -171,21 +161,11 @@
         /// Assumes complement-to-two signed integers.
         /// </summary>
         /// <returns>a - b</returns>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         public static int int_sub_no_overflow(int a, int b)
         {
-            //C# original impl does a lot of pointer magic, to avoid casting the
-            //   org. values. I'm unsure how to do this, going with an ugly hack
-            //   for now.
-            var pa = new IntOrUInt();
-            var pb = new IntOrUInt();
-            pa.I = a;
-            pb.I = b;
-            uint ures = pa.U - pb.U;
-            pa.U = ures;
-            return pa.I;
-
-            //TODO: Test if this can replace the code above
-            //return (int)((uint)a - (uint)b);
+            // C# int arithmetic wraps (unchecked by default), exactly like the uint version upstream.
+            return unchecked(a - b);
         }
     }
 }

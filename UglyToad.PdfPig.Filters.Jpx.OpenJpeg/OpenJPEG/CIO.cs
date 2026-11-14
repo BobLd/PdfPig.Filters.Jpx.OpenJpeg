@@ -1,5 +1,4 @@
-﻿//#define DEBUG_STREAM
-using System;
+﻿using System;
 using System.IO;
 
 namespace OpenJpeg
@@ -34,8 +33,6 @@ namespace OpenJpeg
     /// </remarks>
     public class CIO // Character In/Out
     {
-        #region Variables and properties
-
         /// <summary>
         /// Read buffer
         /// </summary>
@@ -45,12 +42,6 @@ namespace OpenJpeg
         /// Source or destination stream
         /// </summary>
         Stream _s;
-
-#if DEBUG_STREAM
-        MemoryStream _debug_buffer;
-        public delegate Stream CreateDebugStreamFunc(MemoryStream ms);
-        public CreateDebugStreamFunc DebugFunc;
-#endif
 
         /// <summary>
         /// How this stream was opened
@@ -101,10 +92,6 @@ namespace OpenJpeg
         /// </summary>
         public bool CanSeek { get { return _s.CanSeek; } }
 
-        #endregion
-
-        #region Init
-
         internal CIO(CompressionInfo parent, Stream s, OpenMode m) 
         { 
             _s = s;
@@ -121,14 +108,10 @@ namespace OpenJpeg
             _size = (long)(img_size * 0.1625 + 2000);
         }
 
-        #endregion
-
         internal void Skip(uint n)
         {
             _s.Seek(n, SeekOrigin.Current);
         }
-
-        #region Write
 
         public void WriteUShort(ushort n)
         {
@@ -207,10 +190,6 @@ namespace OpenJpeg
         {
             _s.Write(ba, offset, count);
         }
-
-        #endregion
-
-        #region Read
 
         public int Read(byte[] buf, int offset, int count)
         {
@@ -316,8 +295,6 @@ namespace OpenJpeg
                 ((uint)data[pos + 2]) << 8 |
                  (uint)data[pos + 3];
         }
-
-        #endregion
     }
 
     /// <summary>
