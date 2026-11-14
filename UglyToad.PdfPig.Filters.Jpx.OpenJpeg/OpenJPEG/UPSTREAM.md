@@ -81,6 +81,10 @@ Never use fused multiply-add here: it changes rounding.
 
 ## Upstream changes ported after 2.5.3
 
+All changes of v2.5.4 under `src/lib/openjp2` are ported (`f809b80c`, `578c67b3`; the rest of that range is
+documentation and packaging only), and `CompressionInfo.Version` reports `2.5.4`. The list also covers
+the commits after the v2.5.4 tag up to the synced commit.
+
 - `91966314` MCO marker: keep `m_dc_level_shift` when the number of stages is zero
 - `1bb9e915` interleaved tile-parts: restart from the main header end, not the last SOT (#1558)
 - `91d08b11` `opj_j2k_read_sod`: bounds check before writing the tile-part index
