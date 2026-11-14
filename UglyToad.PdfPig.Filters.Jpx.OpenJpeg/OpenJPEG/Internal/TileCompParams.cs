@@ -86,8 +86,6 @@ namespace OpenJpeg.Internal
             return t;
         }
 
-        #region ICloneable
-
         public object Clone()
         {
             var tcp = (TileCompParams)MemberwiseClone();
@@ -96,7 +94,5 @@ namespace OpenJpeg.Internal
             tcp.prch = (uint[])prch.Clone();
             return tcp;
         }
-
-        #endregion
     }
 }

@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,16 +29,15 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
-#region Using
+
 using System;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using OPJ_UINT32 = System.UInt32;
-#endregion
 
 namespace OpenJpeg.Internal
 {
@@ -50,8 +48,6 @@ namespace OpenJpeg.Internal
     {
         private delegate void ThreadWorker(object job);
         private delegate IEnumerable<object> CreateJobs(bool mt, Tier1Coding.SetRet ret);
-
-        #region Variables and properties
 
         internal bool DisableMultiThreading => _cinfo.DisableMultiThreading;
 
@@ -93,6 +89,9 @@ namespace OpenJpeg.Internal
         internal bool WholeTileDecoding { get; set; }
 
         private bool[] _used_component;
+
+        /// <summary>The MCT pass already did the DC level shift of components 0 .. 2 (see MCTDecode)</summary>
+        private bool _dc_shift_done_by_mct;
 
         /// <summary>
         /// Position of the tilepart flag in Progression order
@@ -158,10 +157,6 @@ namespace OpenJpeg.Internal
         /// Time taken to encode a tile
         /// </summary>
         double _encoding_time;
-
-        #endregion
-
-        #region Init
 
         /// <summary>
         /// Creates a tile-coder encoder
@@ -1459,8 +1454,6 @@ namespace OpenJpeg.Internal
             }
         }
 
-        #endregion
-
         //2.5
         bool T2Decode(byte[] src, int src_len, CodestreamIndex cstr_index)
         {
@@ -1607,6 +1600,7 @@ namespace OpenJpeg.Internal
             TcdTilecomp tile_comp = tile_comps[0];
             int samples;
 
+            _dc_shift_done_by_mct = false;
             if (_tcp.mct == 0 || _used_component != null)
                 return true;
 
@@ -1676,40 +1670,37 @@ namespace OpenJpeg.Internal
                 }
                 else
                 {
-                    if (_tcp.tccps[0].qmfbid == 1)
+                    int[] c0 = WholeTileDecoding ? tile.comps[0].data : tile.comps[0].data_win;
+                    int[] c1 = WholeTileDecoding ? tile.comps[1].data : tile.comps[1].data_win;
+                    int[] c2 = WholeTileDecoding ? tile.comps[2].data : tile.comps[2].data_win;
+
+                    // Not in upstream: when the DC level shift of components 0 .. 2 covers the same samples, it is
+                    // done in the MCT pass (one read and write of the three components instead of two; same values).
+                    bool shift = CanShiftInMct(samples, c0, c1, c2);
+                    MCT.DcShift s0 = shift ? DcParams(0) : default, s1 = shift ? DcParams(1) : default, s2 = shift ? DcParams(2) : default;
+                    bool reversible = _tcp.tccps[0].qmfbid == 1;
+                    // Per-sample loops: the ranges are independent, so the split does not change a value.
+                    Parallelism.RunRanges(samples, SamplesPerJob, Parallelism.ThreadCount(_cinfo.DisableMultiThreading), (start, end) =>
                     {
-                        if (WholeTileDecoding)
+                        var a = c0.AsSpan(start, end - start);
+                        var b = c1.AsSpan(start, end - start);
+                        var c = c2.AsSpan(start, end - start);
+                        if (reversible)
                         {
-                            MCT.Decode(tile.comps[0].data,
-                                       tile.comps[1].data,
-                                       tile.comps[2].data,
-                                       samples);
+                            if (shift)
+                                MCT.DecodeDcShift(a, b, c, end - start, s0, s1, s2);
+                            else
+                                MCT.Decode(a, b, c, end - start);
                         }
                         else
                         {
-                            MCT.Decode(tile.comps[0].data_win,
-                                       tile.comps[1].data_win,
-                                       tile.comps[2].data_win,
-                                       samples);
+                            if (shift)
+                                MCT.DecodeRealDcShift(a, b, c, end - start, s0, s1, s2);
+                            else
+                                MCT.DecodeReal(a, b, c, end - start);
                         }
-                    }
-                    else
-                    {
-                        if (WholeTileDecoding)
-                        {
-                            MCT.DecodeReal(tile.comps[0].data,
-                                           tile.comps[1].data,
-                                           tile.comps[2].data,
-                                           samples);
-                        }
-                        else
-                        {
-                            MCT.DecodeReal(tile.comps[0].data_win,
-                                           tile.comps[1].data_win,
-                                           tile.comps[2].data_win,
-                                           samples);
-                        }
-                    }
+                    });
+                    _dc_shift_done_by_mct = shift;
                 }
             }
             else
@@ -1723,6 +1714,7 @@ namespace OpenJpeg.Internal
         /// Vector prefix of the reversible DC level shift row loop: clamp(v + shift, min, max).
         /// Returns how many samples were done; the caller finishes the row with the scalar loop.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static int DcShiftRowInt(Span<int> row, int shift, int min, int max)
         {
             if (!Vector.IsHardwareAccelerated) return 0;
@@ -1741,6 +1733,7 @@ namespace OpenJpeg.Internal
         /// for |f| &lt; 2^22, like lrintf/Math.Round. It stops at the first vector with a value outside that
         /// range (or NaN), leaving the rest to the scalar loop, so results are identical.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static int DcShiftRowFloat(Span<int> row, int shift, int min, int max)
         {
             if (!Vector.IsHardwareAccelerated) return 0;
@@ -1762,101 +1755,159 @@ namespace OpenJpeg.Internal
             return k * Vector<int>.Count;
         }
 
+        /// <summary>Samples one MCT or DC level shift job should have at least (see Parallelism.RunRanges).</summary>
+        const int SamplesPerJob = 65536;
+
         void DcLevelShiftDecode()
         {
             TcdTile tile = _tcd_image.tiles[0];
-            var tccps = _tcp.tccps;
-            int min, max;
 
-            for (int compno = 0; compno < tile.numcomps; ++compno)
+            // Components 0 .. 2 may already be done, in the same pass as the MCT (see MCTDecode)
+            int first = _dc_shift_done_by_mct ? 3 : 0;
+            _dc_shift_done_by_mct = false;
+            for (int compno = first; compno < tile.numcomps; ++compno)
             {
-                if (_used_component != null && !_used_component[compno])
+                if (!DcShiftArea(compno, out var data, out int width, out int height, out int stride, out int min, out int max))
                     continue;
 
-                TcdTilecomp tile_comp = tile.comps[compno];
-                ImageComp imagec = _image.comps[compno];
-                TcdResolution res = tile_comp.resolutions[imagec.resno_decoded];
-                TileCompParams tccp = tccps[compno];
-                int width, height, stride, data_ptr;
-                int[] data;
+                int shift = _tcp.tccps[compno].dc_level_shift;
+                bool reversible = _tcp.tccps[compno].qmfbid == 1;
+                bool useVector = _image.comps[compno].prec <= 24;
+                // Rows are independent: split them over the workers when there are enough samples.
+                int rowsPerJob = Math.Max(SamplesPerJob / width, 1);
+                Parallelism.RunRanges(height, rowsPerJob, Parallelism.ThreadCount(_cinfo.DisableMultiThreading), (start, end) =>
+                {
+                    int ptr = start * (width + stride);
+                    if (reversible)
+                        DcShiftInt(data, ptr, width, end - start, stride, shift, min, max);
+                    else
+                        DcShiftFloat(data, ptr, width, end - start, stride, shift, min, max, useVector);
+                });
+            }
+        }
 
-                if (!WholeTileDecoding)
-                {
-                    width = (int)(res.win_x1 - res.win_x0);
-                    height = (int)(res.win_y1 - res.win_y0);
-                    stride = 0;
-                    data = tile_comp.data_win;
-                    data_ptr = 0;
-                }
-                else
-                {
-                    width = res.x1 - res.x0;
-                    height = res.y1 - res.y0;
-                    stride = tile_comp.resolutions[tile_comp.minimum_num_resolutions - 1].x1 -
-                             tile_comp.resolutions[tile_comp.minimum_num_resolutions - 1].x0 -
-                             width;
-                    data = tile_comp.data;
-                    data_ptr = 0;
-                }
+        /// <summary>
+        /// The samples the DC level shift covers for one component (the decoded resolution, in the tile buffer or
+        /// the window buffer; stride is the gap between rows) and its clamp range. False when there is nothing to do.
+        /// </summary>
+        bool DcShiftArea(int compno, out int[] data, out int width, out int height, out int stride, out int min, out int max)
+        {
+            TcdTilecomp tile_comp = _tcd_image.tiles[0].comps[compno];
+            ImageComp imagec = _image.comps[compno];
+            TcdResolution res = tile_comp.resolutions[imagec.resno_decoded];
 
-                if (imagec.sgnd)
-                {
-                    min = -(1 << ((int)imagec.prec - 1));
-                    max = (1 << ((int)imagec.prec - 1)) - 1;
-                }
-                else
-                {
-                    min = 0;
-                    max = (1 << (int)imagec.prec) - 1;
-                }
+            if (!WholeTileDecoding)
+            {
+                width = (int)(res.win_x1 - res.win_x0);
+                height = (int)(res.win_y1 - res.win_y0);
+                stride = 0;
+                data = tile_comp.data_win;
+            }
+            else
+            {
+                width = res.x1 - res.x0;
+                height = res.y1 - res.y0;
+                stride = tile_comp.resolutions[tile_comp.minimum_num_resolutions - 1].x1 -
+                         tile_comp.resolutions[tile_comp.minimum_num_resolutions - 1].x0 -
+                         width;
+                data = tile_comp.data;
+            }
 
-                if (width == 0 || height == 0)
-                    continue;
+            if (imagec.sgnd)
+            {
+                min = -(1 << ((int)imagec.prec - 1));
+                max = (1 << ((int)imagec.prec - 1)) - 1;
+            }
+            else
+            {
+                min = 0;
+                max = (1 << (int)imagec.prec) - 1;
+            }
 
-                if (_tcp.tccps[compno].qmfbid == 1)
+            return (_used_component == null || _used_component[compno]) && width != 0 && height != 0;
+        }
+
+        /// <summary>
+        /// Whether the DC level shift of components 0 .. 2 can be done in the MCT pass: each covers exactly the
+        /// samples the MCT transforms (in buf0 .. buf2), with the same wavelet as component 0 and, for the 9/7
+        /// path, the vector rounding (precision of 24 bits or less).
+        /// </summary>
+        bool CanShiftInMct(int samples, int[] buf0, int[] buf1, int[] buf2)
+        {
+            for (int c = 0; c < 3; c++)
+            {
+                if (!DcShiftArea(c, out var data, out int width, out int height, out int stride, out _, out _)
+                    || data != (c == 0 ? buf0 : c == 1 ? buf1 : buf2) || stride != 0 || (long)width * height != samples
+                    || _tcp.tccps[c].qmfbid != _tcp.tccps[0].qmfbid
+                    || (_tcp.tccps[0].qmfbid != 1 && _image.comps[c].prec > 24))
+                    return false;
+            }
+            return true;
+        }
+
+        MCT.DcShift DcParams(int compno)
+        {
+            DcShiftArea(compno, out _, out _, out _, out _, out int min, out int max);
+            return new MCT.DcShift(_tcp.tccps[compno].dc_level_shift, min, max);
+        }
+
+        // The two loops below run once per tile component, so under tiering a single-tile image never reaches
+        // tier-1 code (fewer than 30 calls): fully optimised from the first call. Plain loops, nothing for PGO.
+
+        /// <summary>Reversible DC level shift of one component: clamp(v + shift, min, max), row by row.</summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
+        static void DcShiftInt(int[] data, int data_ptr, int width, int height, int stride, int shift, int min, int max)
+        {
+            for (int j = 0; j < height; j++)
+            {
+                int i = DcShiftRowInt(data.AsSpan(data_ptr, width), shift, min, max);
+                data_ptr += i;
+                for (; i < width; i++)
                 {
-                    for (int j = 0; j < height; j++)
+                    data[data_ptr] = MyMath.int_clamp(data[data_ptr] + shift, min, max);
+                    data_ptr++;
+                }
+                data_ptr += stride;
+            }
+        }
+
+        /// <summary>
+        /// Irreversible DC level shift of one component: clamp(round_half_even(f) + shift, min, max), row by row,
+        /// where the int array holds float bits. useVector: precision of 24 bits or less.
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+#endif
+        static void DcShiftFloat(int[] data, int data_ptr, int width, int height, int stride, int shift, int min, int max, bool useVector)
+        {
+            IntOrFloat fi = new IntOrFloat();
+            for (int j = 0; j < height; j++)
+            {
+                int i = useVector ? DcShiftRowFloat(data.AsSpan(data_ptr, width), shift, min, max) : 0;
+                data_ptr += i;
+                for (; i < width; i++)
+                {
+                    fi.I = data[data_ptr];
+                    if (fi.F > int.MaxValue)
                     {
-                        int i = DcShiftRowInt(data.AsSpan(data_ptr, width), tccp.dc_level_shift, min, max);
-                        data_ptr += i;
-                        for (; i < width; i++)
-                        {
-                            data[data_ptr] = MyMath.int_clamp(data[data_ptr] + tccp.dc_level_shift, min, max);
-                            data_ptr++;
-                        }
-                        data_ptr += stride;
+                        data[data_ptr] = max;
                     }
-                }
-                else
-                {
-                    IntOrFloat fi = new IntOrFloat();
-                    for (int j = 0; j < height; j++)
+                    else if (fi.F < int.MinValue)
                     {
-                        int i = imagec.prec <= 24 ? DcShiftRowFloat(data.AsSpan(data_ptr, width), tccp.dc_level_shift, min, max) : 0;
-                        data_ptr += i;
-                        for (; i < width; i++)
-                        {
-                            fi.I = data[data_ptr];
-                            if (fi.F > int.MaxValue)
-                            {
-                                data[data_ptr] = max;
-                            }
-                            else if (fi.F < int.MinValue)
-                            {
-                                data[data_ptr] = min;
-                            }
-                            else 
-                            {
-                                // Do addition on int64 to avoid overflows
-                                //long value_int = lrintf(fi.F);
-                                long value_int = (long)Math.Round(fi.F); //<-- Impl. banker's rounding (round towards even).
-                                data[data_ptr] = (int)MyMath.int64_clamp(value_int + tccp.dc_level_shift, min, max);
-                            }
-                            data_ptr++;
-                        }
-                        data_ptr += stride;
+                        data[data_ptr] = min;
                     }
+                    else
+                    {
+                        // Do addition on int64 to avoid overflows
+                        //long value_int = lrintf(fi.F);
+                        long value_int = (long)Math.Round(fi.F); //<-- Impl. banker's rounding (round towards even).
+                        data[data_ptr] = (int)MyMath.int64_clamp(value_int + shift, min, max);
+                    }
+                    data_ptr++;
                 }
+                data_ptr += stride;
             }
         }
 

@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -29,7 +28,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System;
 using System.Diagnostics;
 
@@ -60,16 +59,10 @@ namespace OpenJpeg.Internal
     /// </remarks>
     internal sealed class TagTree
     {
-        #region Variables and properties
-
         uint _numleafsh;
         uint _numleafsv;
         uint _numnodes;
         TagNode[] nodes;
-
-        #endregion
-
-        #region Init
 
         //2.5 - opj_tgt_create
         internal static TagTree Create(uint numleafsh, uint numleafsv, CompressionInfo cinfo)
@@ -268,8 +261,6 @@ namespace OpenJpeg.Internal
                 current_node.known = false;
             }
         }
-
-        #endregion
 
         /// <summary>
         /// Set the value of a leaf of a tag-tree

@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -29,8 +28,11 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System;
+using System.Runtime.InteropServices;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Diagnostics;
 using System.Collections.Generic;
 
@@ -64,8 +66,6 @@ namespace OpenJpeg.Internal
     /// </summary>
     internal sealed class Tier1Coding
     {
-        #region Variables and properties
-
         MQCoder _mqc;
 
         int[] _data;
@@ -166,19 +166,11 @@ namespace OpenJpeg.Internal
         //    flags[idx] = (T1)((uint)flags[idx] & ~(0x000000FF << upper) | ((uint)value << upper));
         //}
 
-        #endregion
-
-        #region Init
-
         //2.5
         internal Tier1Coding()
         {
             _mqc = new MQCoder();
         }
-
-        #endregion
-
-        #region Encoder
 
         /// <summary>
         /// Generate jobs
@@ -1135,8 +1127,6 @@ namespace OpenJpeg.Internal
             //UPLOAD_MQC_VARIABLES
         }
 
-        #endregion
-
         //2.5 - opj_t1_decode_cblks
         internal static IEnumerable<T1CBLKDecodeProcessingJob> DecodeCblks(TileCoder tcd,
             TcdTilecomp tilec, TileCompParams tccp, bool check_pterm,
@@ -1323,17 +1313,6 @@ namespace OpenJpeg.Internal
                 {
                     for (uint i = 0; i < cblk_w; i++)
                     {
-#if TEST_MATH_MODE
-                        tmp.I = tiledp_ar[tiledp + (j + 0) * tile_w + i];
-                        //lrintf == bankers rounding
-                        d1[t1data++] = (int)(float)Math.Round((float)((float)(tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS)));
-                        tmp.I = tiledp_ar[tiledp + (j + 1) * tile_w + i];
-                        d1[t1data++] = (int)(float)Math.Round((float)((float)(tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS)));
-                        tmp.I = tiledp_ar[tiledp + (j + 2) * tile_w + i];
-                        d1[t1data++] = (int)(float)Math.Round((float)((float)(tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS)));
-                        tmp.I = tiledp_ar[tiledp + (j + 3) * tile_w + i];
-                        d1[t1data++] = (int)(float)Math.Round((float)((float)(tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS)));
-#else
                         tmp.I = tiledp_ar[tiledp + (j + 0) * tile_w + i];
                         //lrintf == bankers rounding
                         d1[t1data++] = (int)Math.Round((tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS));
@@ -1343,7 +1322,6 @@ namespace OpenJpeg.Internal
                         d1[t1data++] = (int)Math.Round((tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS));
                         tmp.I = tiledp_ar[tiledp + (j + 3) * tile_w + i];
                         d1[t1data++] = (int)Math.Round((tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS));
-#endif
                     }
                 }
                 if (j < cblk_h)
@@ -1352,13 +1330,8 @@ namespace OpenJpeg.Internal
                     {
                         for (uint k = j; k < cblk_h; k++)
                         {
-#if TEST_MATH_MODE
-                            tmp.I = tiledp_ar[tiledp + k * tile_w + i];
-                            d1[t1data++] = (int)(float)Math.Round((float)((float)(tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS)));
-#else
                             tmp.I = tiledp_ar[tiledp + k * tile_w + i];
                             d1[t1data++] = (int)Math.Round((tmp.F / band.stepsize) * (1 << Constants.T1_NMSEDEC_FRACBITS));
-#endif
                         }
                     }
                 }
@@ -1383,6 +1356,52 @@ namespace OpenJpeg.Internal
                     job.tile.distotile += cumwmsedec;
                 }
             }
+        }
+
+        /// <summary>
+        /// dst[i] = src[i] / 2, truncating like C (5/3 code-block samples carry one extra bit). src and dst may be
+        /// the same span.
+        /// </summary>
+        static void HalveSamples(ReadOnlySpan<int> src, Span<int> dst)
+        {
+            int i = 0;
+#if NET7_0_OR_GREATER
+            if (Vector.IsHardwareAccelerated)
+            {
+                var vs = MemoryMarshal.Cast<int, Vector<int>>(src);
+                var vd = MemoryMarshal.Cast<int, Vector<int>>(dst);
+                for (int k = 0; k < vs.Length; k++)
+                {
+                    var v = vs[k];
+                    // Adding the sign bit before the arithmetic shift rounds towards zero, like v / 2.
+                    vd[k] = (v + Vector.ShiftRightLogical(v, 31)) >> 1;
+                }
+                i = vs.Length * Vector<int>.Count;
+            }
+#endif
+            for (; i < src.Length; i++)
+                dst[i] = src[i] / 2;
+        }
+
+        /// <summary>
+        /// dst[i] = float bits of ((float)src[i] * stepsize), the 9/7 dequantisation. Same conversion and multiply
+        /// per element as the scalar code, so the bits are identical. src and dst may be the same span.
+        /// </summary>
+        static void ScaleSamplesToFloatBits(ReadOnlySpan<int> src, Span<int> dst, float stepsize)
+        {
+            int i = 0;
+            if (Vector.IsHardwareAccelerated)
+            {
+                var vs = MemoryMarshal.Cast<int, Vector<int>>(src);
+                var vd = MemoryMarshal.Cast<int, Vector<float>>(dst);
+                var vstep = new Vector<float>(stepsize);
+                for (int k = 0; k < vs.Length; k++)
+                    vd[k] = Vector.ConvertToSingle(vs[k]) * vstep;
+                i = vs.Length * Vector<int>.Count;
+            }
+            var df = MemoryMarshal.Cast<int, float>(dst);
+            for (; i < src.Length; i++)
+                df[i] = (float)src[i] * stepsize;
         }
 
         /// <remarks>
@@ -1519,77 +1538,22 @@ namespace OpenJpeg.Internal
 
             if (cblk.decoded_data != null)
             {
-                uint cblk_size = cblk_w * cblk_h;
+                // Partial decoding: dequantise in place (upstream: SSE2 branch for the 9/7 case).
+                var cblk_data = datap.AsSpan(0, (int)(cblk_w * cblk_h));
                 if (tccp.qmfbid == 1)
-                {
-                    for (int i = 0; i < cblk_size; ++i)
-                    {
-                        datap[i] /= 2;
-                    }
-                }
+                    HalveSamples(cblk_data, cblk_data);
                 else
-                {
-                    float stepsize = 0.5f * band.stepsize;
-                    // SSE2 is possible on .net 5
-                    // https://learn.microsoft.com/en-us/dotnet/api/system.runtime.intrinsics.x86.sse2.converttovector128single?view=net-7.0
-                    // but for now we're sticking with the old
-                    int i = 0;
-                    #region SSE2
-                    //# ifdef __SSE2__
-                    //                    {
-                    //                        const __m128 xmm_stepsize = _mm_set1_ps(stepsize);
-                    //                        for (; i < (cblk_size & ~15U); i += 16)
-                    //                        {
-                    //                            __m128 xmm0_data = _mm_cvtepi32_ps(_mm_load_si128((__m128i * const)(
-                    //                                                                   datap + 0)));
-                    //                        __m128 xmm1_data = _mm_cvtepi32_ps(_mm_load_si128((__m128i * const)(
-                    //                                                               datap + 4)));
-                    //                        __m128 xmm2_data = _mm_cvtepi32_ps(_mm_load_si128((__m128i * const)(
-                    //                                                               datap + 8)));
-                    //                        __m128 xmm3_data = _mm_cvtepi32_ps(_mm_load_si128((__m128i * const)(
-                    //                                                               datap + 12)));
-                    //                        _mm_store_ps((float*)(datap + 0), _mm_mul_ps(xmm0_data, xmm_stepsize));
-                    //                        _mm_store_ps((float*)(datap + 4), _mm_mul_ps(xmm1_data, xmm_stepsize));
-                    //                        _mm_store_ps((float*)(datap + 8), _mm_mul_ps(xmm2_data, xmm_stepsize));
-                    //                        _mm_store_ps((float*)(datap + 12), _mm_mul_ps(xmm3_data, xmm_stepsize));
-                    //                        datap += 16;
-                    //                    }
-                    //                }
-                    //#endif
-                    #endregion
-                    IntOrFloat tmp = new IntOrFloat();
-                    for (; i < cblk_size; ++i)
-                    {
-                        tmp.F = datap[i] * stepsize;
-
-                        datap[i] = tmp.I;
-                    }
-                }
+                    ScaleSamplesToFloatBits(cblk_data, cblk_data, 0.5f * band.stepsize);
             }
             else if (tccp.qmfbid == 1)
             {
+                // Upstream: AVX2/AVX-512 branch, (v + (v >>> 31)) >> 1 per row.
                 var tiled = tilec.data;
                 int tiledp = y * (int)tile_w + x;
-
                 for (uint j = 0; j < cblk_h; j++)
                 {
-                    uint i = 0, end = cblk_w & ~3U;
-                    for (; i < end; i += 4U)
-                    {
-                        int tmp0 = datap[(j * cblk_w) + i + 0U];
-                        int tmp1 = datap[(j * cblk_w) + i + 1U];
-                        int tmp2 = datap[(j * cblk_w) + i + 2U];
-                        int tmp3 = datap[(j * cblk_w) + i + 3U];
-                        tiled[tiledp + j * tile_w + i + 0U] = tmp0 / 2;
-                        tiled[tiledp + j * tile_w + i + 1U] = tmp1 / 2;
-                        tiled[tiledp + j * tile_w + i + 2U] = tmp2 / 2;
-                        tiled[tiledp + j * tile_w + i + 3U] = tmp3 / 2;
-                    }
-                    for (; i < cblk_w; ++i)
-                    {
-                        int tmp = datap[(j * cblk_w) + i];
-                        tiled[tiledp + (j * tile_w) + i] = tmp / 2;
-                    }
+                    HalveSamples(datap.AsSpan((int)(j * cblk_w), (int)cblk_w),
+                                 tiled.AsSpan(tiledp + (int)(j * tile_w), (int)cblk_w));
                 }
             }
             else
@@ -1597,18 +1561,10 @@ namespace OpenJpeg.Internal
                 float stepsize = 0.5f * band.stepsize;
                 var tiled = tilec.data;
                 int tiledp = y * (int)tile_w + x;
-                IntOrFloat tmp = new IntOrFloat();
-                for (uint j = 0, pp = 0; j < cblk_h; j++)
+                for (uint j = 0; j < cblk_h; j++)
                 {
-                    int tiledp2 = tiledp;
-                    for (int i=0; i < cblk_w; i++)
-                    {
-                        tmp.F = (float)datap[pp] * stepsize;
-                        tiled[tiledp2] = tmp.I;
-                        pp++;
-                        tiledp2++;
-                    }
-                    tiledp += (int)tile_w;
+                    ScaleSamplesToFloatBits(datap.AsSpan((int)(j * cblk_w), (int)cblk_w),
+                                            tiled.AsSpan(tiledp + (int)(j * tile_w), (int)cblk_w), stepsize);
                 }
             }
         }
@@ -3245,6 +3201,23 @@ namespace OpenJpeg.Internal
         }
 
         //2.5.3 - opj_t1_decode_cblk
+        /// <summary>
+        /// v ? -x : x without a branch. v is a freshly decoded bit, so a branch on it mispredicts about half the time
+        /// (C compilers emit a cmov for the upstream macros).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int NegateIf(bool v, int x)
+        {
+            int m = v ? 1 : 0;
+            return (x ^ -m) + m;
+        }
+
+        /// <summary>
+        /// Refinement update x += (v ^ (x &lt; 0)) ? poshalf : -poshalf (opj_t1_dec_refpass_step_mqc_macro), branch-free.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int RefineSample(int x, bool v, int poshalf) => x + NegateIf(v == (x < 0), poshalf);
+
         private bool DecodeCblk(TcdCblkDec cblk,
                                   uint orient,
                                   uint roishift,
@@ -3417,6 +3390,7 @@ namespace OpenJpeg.Internal
         //2.5 - opj_t1_dec_sigpass_raw
         void DecSigpassRaw(int bpno, CCP_CBLKSTY cblksty)
         {
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
             int data = 0; //<- pointer to _data
             int flagsp = T1_FLAGS(0, 0); //<- pointer to flags
             int w = (int)_w;
@@ -3429,7 +3403,7 @@ namespace OpenJpeg.Internal
             {
                 for (int i = 0; i < w; i++, flagsp++, data++)
                 {
-                    if (this.flags[flagsp] != T1.NONE)
+                    if (flg[flagsp] != T1.NONE)
                     {
                         DecSigpassStepRaw(flagsp, data, oneplushalf, (cblksty & CCP_CBLKSTY.VSC) != 0, 0);
                         DecSigpassStepRaw(flagsp, data + w, oneplushalf, false, 1);
@@ -3505,6 +3479,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecClnpass64x64_vsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_clnpass_internal
             //(t1, bpno,      vsc,  w,  h, flags_stride)
             // t1, bpno, OPJ_TRUE, 64, 64, 66
@@ -3527,17 +3509,17 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags == 0)
                     {
                         bool partial = true;
-                        _mqc.Setcurctx(T1_CTXNO.AGG); //opj_t1_setcurctx macro
-                        v = _mqc.Decode(); //opj_mqc_decode_macro
+                        cx = (int)(T1_CTXNO.AGG); //opj_t1_setcurctx macro
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //opj_mqc_decode_macro
                         if (!v)
                             continue;
-                        _mqc.Setcurctx(T1_CTXNO.UNI); //opj_t1_setcurctx macro
-                        runlen = _mqc.Decode() ? 1u : 0u;
-                        v = _mqc.Decode();
+                        cx = (int)(T1_CTXNO.UNI); //opj_t1_setcurctx macro
+                        runlen = MQCoder.Decode(ref mqr, mqctx, cx, mqc) ? 1u : 0u;
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc);
                         runlen = (runlen << 1) | (v ? 1u : 0u);
                         switch(runlen)
                         {
@@ -3556,21 +3538,21 @@ namespace OpenJpeg.Internal
                                             if (!true)
                                             {
 #pragma warning disable CS0162 // Unreachable code detected
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
 #pragma warning restore CS0162 // Unreachable code detected
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                             }
                                         } while (false);
                                     }
@@ -3591,20 +3573,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -3625,20 +3607,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -3659,20 +3641,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -3695,20 +3677,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                     }
                                 } while (false);
                             }
@@ -3726,20 +3708,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -3757,20 +3739,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -3788,26 +3770,26 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                     }
                                 } while (false);
                             }
                         }
                     }
-                    this.flags[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
+                    flg[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
             //UPLOAD_MQC_VARIABLES
@@ -3817,11 +3799,14 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecClnpassStep(flagsp, data + j * w, oneplushalf, j, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                     flags[flagsp] &= ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -3831,6 +3816,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecClnpassGeneric_vsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_clnpass_internal
             //(t1, bpno,      vsc,  w,  h, flags_stride)
             // t1, bpno, OPJ_TRUE, _w, :h, _w + 2
@@ -3853,17 +3846,17 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags == 0)
                     {
                         bool partial = true;
-                        _mqc.Setcurctx(T1_CTXNO.AGG); //opj_t1_setcurctx macro
-                        v = _mqc.Decode(); //opj_mqc_decode_macro
+                        cx = (int)(T1_CTXNO.AGG); //opj_t1_setcurctx macro
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //opj_mqc_decode_macro
                         if (!v)
                             continue;
-                        _mqc.Setcurctx(T1_CTXNO.UNI); //opj_t1_setcurctx macro
-                        runlen = _mqc.Decode() ? 1u : 0u;
-                        v = _mqc.Decode();
+                        cx = (int)(T1_CTXNO.UNI); //opj_t1_setcurctx macro
+                        runlen = MQCoder.Decode(ref mqr, mqctx, cx, mqc) ? 1u : 0u;
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc);
                         runlen = (runlen << 1) | (v ? 1u : 0u);
                         switch (runlen)
                         {
@@ -3882,21 +3875,21 @@ namespace OpenJpeg.Internal
                                             if (!true)
                                             {
 #pragma warning disable CS0162 // Unreachable code detected
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
 #pragma warning restore CS0162 // Unreachable code detected
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
                                             }
                                         } while (false);
                                     }
@@ -3917,20 +3910,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -3951,20 +3944,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -3985,20 +3978,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4021,20 +4014,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
                                     }
                                 } while (false);
                             }
@@ -4052,20 +4045,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -4083,20 +4076,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -4114,26 +4107,26 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                     }
                                 } while (false);
                             }
                         }
                     }
-                    this.flags[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
+                    flg[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
             //UPLOAD_MQC_VARIABLES
@@ -4143,11 +4136,14 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecClnpassStep(flagsp, data + j * w, oneplushalf, j, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                     flags[flagsp] &= ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -4157,6 +4153,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecClnpass64x64_novsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_clnpass_internal
             //(t1, bpno,      vsc,  w,  h, flags_stride)
             // t1, bpno, OPJ_FALSE, 64, 64, 66
@@ -4179,17 +4183,17 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags == 0)
                     {
                         bool partial = true;
-                        _mqc.Setcurctx(T1_CTXNO.AGG); //opj_t1_setcurctx macro
-                        v = _mqc.Decode(); //opj_mqc_decode_macro
+                        cx = (int)(T1_CTXNO.AGG); //opj_t1_setcurctx macro
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //opj_mqc_decode_macro
                         if (!v)
                             continue;
-                        _mqc.Setcurctx(T1_CTXNO.UNI); //opj_t1_setcurctx macro
-                        runlen = _mqc.Decode() ? 1u : 0u;
-                        v = _mqc.Decode();
+                        cx = (int)(T1_CTXNO.UNI); //opj_t1_setcurctx macro
+                        runlen = MQCoder.Decode(ref mqr, mqctx, cx, mqc) ? 1u : 0u;
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc);
                         runlen = (runlen << 1) | (v ? 1u : 0u);
                         switch (runlen)
                         {
@@ -4208,21 +4212,21 @@ namespace OpenJpeg.Internal
                                             if (!true)
                                             {
 #pragma warning disable CS0162 // Unreachable code detected
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
 #pragma warning restore CS0162 // Unreachable code detected
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                             }
                                         } while (false);
                                     }
@@ -4243,20 +4247,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4277,20 +4281,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4311,20 +4315,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4347,20 +4351,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                     }
                                 } while (false);
                             }
@@ -4378,20 +4382,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -4409,20 +4413,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -4440,26 +4444,26 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                     }
                                 } while (false);
                             }
                         }
                     }
-                    this.flags[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
+                    flg[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
             //UPLOAD_MQC_VARIABLES
@@ -4469,11 +4473,14 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecClnpassStep(flagsp, data + j * w, oneplushalf, j, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                     flags[flagsp] &= ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -4483,6 +4490,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecClnpassGeneric_novsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_clnpass_internal
             //(t1, bpno,      vsc,  w,  h, flags_stride)
             // t1, bpno, OPJ_FALSE,_w, :h, _w + 2
@@ -4505,17 +4520,17 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags == 0)
                     {
                         bool partial = true;
-                        _mqc.Setcurctx(T1_CTXNO.AGG); //opj_t1_setcurctx macro
-                        v = _mqc.Decode(); //opj_mqc_decode_macro
+                        cx = (int)(T1_CTXNO.AGG); //opj_t1_setcurctx macro
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //opj_mqc_decode_macro
                         if (!v)
                             continue;
-                        _mqc.Setcurctx(T1_CTXNO.UNI); //opj_t1_setcurctx macro
-                        runlen = _mqc.Decode() ? 1u : 0u;
-                        v = _mqc.Decode();
+                        cx = (int)(T1_CTXNO.UNI); //opj_t1_setcurctx macro
+                        runlen = MQCoder.Decode(ref mqr, mqctx, cx, mqc) ? 1u : 0u;
+                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc);
                         runlen = (runlen << 1) | (v ? 1u : 0u);
                         switch (runlen)
                         {
@@ -4534,21 +4549,21 @@ namespace OpenJpeg.Internal
                                             if (!true)
                                             {
 #pragma warning disable CS0162 // Unreachable code detected
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
 #pragma warning restore CS0162 // Unreachable code detected
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
                                             }
                                         } while (false);
                                     }
@@ -4569,20 +4584,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4603,20 +4618,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4637,20 +4652,20 @@ namespace OpenJpeg.Internal
                                         {
                                             if (!partial)
                                             {
-                                                var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                                _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                                cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 if (!v)
                                                     break;
                                             }
                                             {
                                                 T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                                    flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                                _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                                v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                                    flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                                cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                                 v = v ^ T1Luts.Getspb(lu);
-                                                _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                                UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                                dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                                flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                             }
                                         } while (false);
                                     }
@@ -4673,20 +4688,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, vsc);
                                     }
                                 } while (false);
                             }
@@ -4704,20 +4719,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -4735,20 +4750,20 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                     }
                                 } while (false);
                             }
@@ -4766,26 +4781,26 @@ namespace OpenJpeg.Internal
                                 {
                                     if (!false)
                                     {
-                                        var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                        _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                        var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                        cx = (int)(ctxt1); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         if (!v)
                                             break;
                                     }
                                     {
                                         T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                            flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
-                                        _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
-                                        v = _mqc.Decode(); //<- opj_mqc_decode_macro
+                                            flags, flg[flagsp - 1], flg[flagsp + 1], ci);
+                                        cx = (int)(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
+                                        v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<- opj_mqc_decode_macro
                                         v = v ^ T1Luts.Getspb(lu);
-                                        _data[data + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                                        UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
+                                        dat[data + ci * data_stride] = NegateIf(v, oneplushalf);
+                                        flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, (uint)flags_stride, false);
                                     }
                                 } while (false);
                             }
                         }
                     }
-                    this.flags[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
+                    flg[flagsp] = flags & ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
             //UPLOAD_MQC_VARIABLES
@@ -4795,16 +4810,20 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecClnpassStep(flagsp, data + j * w, oneplushalf, j, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                     flags[flagsp] &= ~(T1.PI_0 | T1.PI_1 | T1.PI_2 | T1.PI_3);
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         //2.5 - opj_t1_dec_refpass_raw
         void DecRefpassRaw(int bpno)
         {
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
             int one, poshalf;
             int i, j, k;
             int data = 0; //Pointer to this._data
@@ -4816,7 +4835,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++flagsp, ++data)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         DecRefpassStepRaw(flagsp, data, poshalf, 0);
@@ -4854,6 +4873,13 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecRefpassMqc64x64(int bpno)
         {
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_refpass_mqc_internal
             //(t1, bpno,  w,  h, flags_stride)
             // t1, bpno, 64, 64, 66;
@@ -4873,7 +4899,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         //opj_t1_dec_refpass_step_mqc_macro
@@ -4886,9 +4912,9 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
@@ -4902,9 +4928,9 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
@@ -4918,9 +4944,9 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
@@ -4934,13 +4960,13 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
-                        this.flags[flagsp] = flags;
+                        flg[flagsp] = flags;
                     }
                 }
             }
@@ -4951,10 +4977,13 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecRefpassStepMqc(flagsp, data + j * w, poshalf, j);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -4964,6 +4993,13 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecRefpassMqcGeneric(int bpno)
         {
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_refpass_mqc_internal
             //(t1, bpno,     w,     h, flags_stride)
             // t1, bpno, t1->w, t1->h, t1->w + 2U
@@ -4983,7 +5019,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         //opj_t1_dec_refpass_step_mqc_macro
@@ -4996,9 +5032,9 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
@@ -5012,9 +5048,9 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
@@ -5028,9 +5064,9 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
@@ -5044,13 +5080,13 @@ namespace OpenJpeg.Internal
                                 (T1)((uint)T1.SIGMA_THIS << (ci * 3)))
                             {
                                 uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
-                                _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                                _data[data + ci * data_stride] += (v ^ (_data[data + ci * data_stride] < 0)) ? poshalf : -poshalf;
+                                cx = (int)((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
+                                dat[data + ci * data_stride] = RefineSample(dat[data + ci * data_stride], v, poshalf);
                                 flags |= (T1)((uint)T1.MU_THIS << (ci * 3));
                             }
                         }
-                        this.flags[flagsp] = flags;
+                        flg[flagsp] = flags;
                     }
                 }
             }
@@ -5061,10 +5097,13 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecRefpassStepMqc(flagsp, data + j * w, poshalf, j);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         //2.5 - opj_t1_dec_sigpass_mqc
@@ -5093,6 +5132,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecSigpassMqc64x64_vsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             const int flags_stride = 66;
             const int width = 64;
             const uint height = 64;
@@ -5119,7 +5166,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         //Macro: opj_t1_dec_sigpass_step_mqc_macro
@@ -5130,23 +5177,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5159,23 +5206,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5188,23 +5235,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5217,28 +5264,28 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
                         }
-                        this.flags[flagsp] = flags;
+                        flg[flagsp] = flags;
                     }
                 }
             }
@@ -5249,10 +5296,13 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecSigpassStepMqc(flagsp, data + (int)j * w, oneplushalf, (int)j, flags_stride, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -5262,6 +5312,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecSigpassMqcGeneric_vsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             uint flags_stride = _w + 2u;
             const bool vsc = true;
 
@@ -5286,7 +5344,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         //Macro: opj_t1_dec_sigpass_step_mqc_macro
@@ -5297,23 +5355,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5326,23 +5384,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5355,23 +5413,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5384,28 +5442,28 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
                         }
-                        this.flags[flagsp] = flags;
+                        flg[flagsp] = flags;
                     }
                 }
             }
@@ -5416,10 +5474,13 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecSigpassStepMqc(flagsp, data + (int)j * w, oneplushalf, (int)j, flags_stride, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -5429,6 +5490,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecSigpassMqc64x64_novsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             const int flags_stride = 66;
             const int width = 64;
             const uint height = 64;
@@ -5455,7 +5524,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         //Macro: opj_t1_dec_sigpass_step_mqc_macro
@@ -5466,23 +5535,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5495,23 +5564,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5524,23 +5593,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5553,28 +5622,28 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
                         }
-                        this.flags[flagsp] = flags;
+                        flg[flagsp] = flags;
                     }
                 }
             }
@@ -5585,10 +5654,13 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecSigpassStepMqc(flagsp, data + (int)j * w, oneplushalf, (int)j, flags_stride, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -5598,6 +5670,14 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecSigpassMqcGeneric_novsc(int bpno)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            // Decode on local copies of the MQ registers (upstream DOWNLOAD_MQC_VARIABLES)
+            MqcRegs mqr; mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
+            int cx; // context of the next decode: set right before each one, so it is never live across the loops
+            uint[] mqctx = _mqc.ctxs;
+            MQCoder mqc = _mqc;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             uint flags_stride = _w + 2u;
             const bool vsc = false;
 
@@ -5622,7 +5702,7 @@ namespace OpenJpeg.Internal
             {
                 for (i = 0; i < w; ++i, ++data, ++flagsp)
                 {
-                    T1 flags = this.flags[flagsp];
+                    T1 flags = flg[flagsp];
                     if (flags != 0)
                     {
                         //Macro: opj_t1_dec_sigpass_step_mqc_macro
@@ -5633,23 +5713,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5662,23 +5742,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5691,23 +5771,23 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
@@ -5720,28 +5800,28 @@ namespace OpenJpeg.Internal
                             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
                             {
-                                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
-                                v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                                cx = (int)(ctxt1); //<-- opj_t1_setcurctx
+                                v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                 if (v)
                                 {
                                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                                         flags,
-                                                        this.flags[flagsp - 1],
-                                                        this.flags[flagsp + 1],
+                                                        flg[flagsp - 1],
+                                                        flg[flagsp + 1],
                                                         ci);
                                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                                     bool spb = T1Luts.Getspb(lu);
-                                    _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
-                                    v = _mqc.Decode(); //<-- opj_mqc_decode_macro
+                                    cx = (int)(ctxt2); //<-- opj_t1_setcurctx
+                                    v = MQCoder.Decode(ref mqr, mqctx, cx, mqc); //<-- opj_mqc_decode_macro
                                     v = v ^ spb;
-                                    _data[data + ci * w] = v ? -oneplushalf : oneplushalf;
-                                    UpdateFlagsMacro(ref flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
+                                    dat[data + ci * w] = NegateIf(v, oneplushalf);
+                                    flags = UpdateFlagsMacro(flg, flags, flagsp, ci, v ? 1u : 0u, flags_stride, false);
                                 }
                                 flags |= (T1)((uint)T1.PI_THIS << (ci * 3));
                             }
                         }
-                        this.flags[flagsp] = flags;
+                        flg[flagsp] = flags;
                     }
                 }
             }
@@ -5752,10 +5832,13 @@ namespace OpenJpeg.Internal
                 {
                     for (j = 0; j < h - k; ++j)
                     {
+                        _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct;
                         DecSigpassStepMqc(flagsp, data + (int)j * w, oneplushalf, (int)j, flags_stride, vsc);
+                        mqr.a = _mqc.a; mqr.c = _mqc.c; mqr.ct = _mqc.ct;
                     }
                 }
             }
+            _mqc.a = mqr.a; _mqc.c = mqr.c; _mqc.ct = mqr.ct; // UPLOAD_MQC_VARIABLES
         }
 
         /// <remarks>
@@ -5765,40 +5848,45 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecSigpassStepMqc(int flagsp, int datap, int oneplushalf, int ci, uint flags_stride, bool vsc)
         {
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
             //opj_t1_dec_sigpass_step_mqc_macro
             //(flags,  flagsp, flags_stride,  data, data_stride, ci, mqc,      curctx, v,      a,      c,      ct, oneplushalf, vsc)
             //*flagsp, flagsp, flags_stride, datap,           0, ci, mqc, mqc->curctx, v, mqc->a, mqc->c, mqc->ct, oneplushalf, vsc
             const int data_stride = 0;
-            T1 flags = this.flags[flagsp];
+            T1 flags = flg[flagsp];
             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == 0U &&
                                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != 0U)
             {
-                uint ctxt1 = _mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
-                _mqc.curctx = _mqc.ctxs[ctxt1]; //<-- opj_t1_setcurctx
+                uint ctxt1 = T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
+                _mqc.curctx = (int)(ctxt1); //<-- opj_t1_setcurctx
                 bool v = _mqc.Decode(); //<-- opj_mqc_decode_macro
                 if (v)
                 {
                     T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
                                         flags,
-                                        this.flags[flagsp - 1],
-                                        this.flags[flagsp + 1],
+                                        flg[flagsp - 1],
+                                        flg[flagsp + 1],
                                         ci);
                     T1_CTXNO ctxt2 = (T1_CTXNO)T1Luts.Getctxno_sc(lu);
                     bool spb = T1Luts.Getspb(lu);
                     _mqc.Setcurctx(ctxt2); //<-- opj_t1_setcurctx
                     v = _mqc.Decode(); //<-- opj_mqc_decode_macro
                     v = v ^ spb;
-                    _data[datap + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                    UpdateFlagsMacro(ref this.flags[flagsp], flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                    dat[datap + ci * data_stride] = NegateIf(v, oneplushalf);
+                    flg[flagsp] = UpdateFlagsMacro(flg, flg[flagsp], flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                 }
-                this.flags[flagsp] |= (T1)((uint)T1.PI_THIS << (ci * 3));
+                flg[flagsp] |= (T1)((uint)T1.PI_THIS << (ci * 3));
             }
         }
 
         //2.5 - opj_t1_dec_refpass_step_mqc
         void DecRefpassStepMqc(int flagsp, int datap, int poshalf, int ci)
         {
-            T1 flags = this.flags[flagsp];
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
+            T1 flags = flg[flagsp];
             //opj_t1_dec_refpass_step_mqc_macro
             //(  flags,  data, data_stride, ci, mqc, curctx, v, a, c, ct, poshalf)
             // *flagsp, datap,           0, ci, mqc, curctx, v, a, c, ct, poshalf
@@ -5810,8 +5898,8 @@ namespace OpenJpeg.Internal
                     uint ctxt = T1Luts.Getctxno_mag((T1)((uint)flags >> (ci * 3)));
                     _mqc.Setcurctx((T1_CTXNO)ctxt); //<-- opj_t1_setcurctx macro
                     bool v = _mqc.Decode(); //<-- opj_mqc_decode_macro
-                    _data[datap + ci * data_stride] += (v ^ (_data[datap + ci * data_stride] < 0)) ? poshalf : -poshalf;
-                    this.flags[flagsp] |= (T1)((uint)T1.MU_THIS << (ci * 3));
+                    dat[datap + ci * data_stride] = RefineSample(dat[datap + ci * data_stride], v, poshalf);
+                    flg[flagsp] |= (T1)((uint)T1.MU_THIS << (ci * 3));
                 }
             }
         }
@@ -5819,12 +5907,13 @@ namespace OpenJpeg.Internal
         //2.5 - opj_t1_dec_refpass_step_raw
         void DecRefpassStepRaw(int flagsp, int datap, int poshalf, int ci)
         {
+            int[] dat = _data;
             T1 flag = flags[flagsp];
             if ((flag & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) ==
                 ((T1)((uint)T1.SIGMA_THIS << (ci * 3))))
             {
                 bool v = _mqc.RawDecode();
-                _data[datap] += (v ^ (_data[datap] < 0)) ? poshalf : -poshalf;
+                dat[datap] = RefineSample(dat[datap], v, poshalf);
                 flags[flagsp] |= (T1)((uint)T1.MU_THIS << (ci * 3));
             }
         }
@@ -5832,13 +5921,14 @@ namespace OpenJpeg.Internal
         //2.1
         void DecRefpassStepRaw(int flag_pos, int data_pos, int poshalf, int neghalf, bool vsc)
         {
+            int[] dat = _data;
             T1 flag = vsc ? (flags[flag_pos] & (~(T1.SIG_S | T1.SIG_SE | T1.SIG_SW | T1.SGN_S))) : flags[flag_pos];
             if ((flag & (T1.SIG | T1.VISIT)) == T1.SIG)
             {
                 throw new NotImplementedException();
                 //bool v = raw.Decode();
                 //int t = v ? poshalf : neghalf;
-                //_data[data_pos] += _data[data_pos] < 0 ? -t : t;
+                //dat[data_pos] += dat[data_pos] < 0 ? -t : t;
                 //flags[flag_pos] |= T1.REFINE;
             }
         }
@@ -5846,7 +5936,9 @@ namespace OpenJpeg.Internal
         //2.5 - opj_t1_dec_sigpass_step_raw
         void DecSigpassStepRaw(int flagsp, int datap, int oneplushalf, bool vsc, int ci)
         {
-            T1 flags = this.flags[flagsp];
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
+            T1 flags = flg[flagsp];
 
             if ((flags & (T1)((uint)(T1.SIGMA_THIS | T1.PI_THIS) << (ci * 3))) == T1.NONE &&
                 (flags & (T1)((uint)T1.SIGMA_NEIGHBOURS << (ci * 3))) != T1.NONE)
@@ -5854,10 +5946,10 @@ namespace OpenJpeg.Internal
                 if (_mqc.RawDecode())
                 {
                     bool v = _mqc.RawDecode();
-                    _data[datap] = v ? -oneplushalf : oneplushalf;
+                    dat[datap] = NegateIf(v, oneplushalf);
                     UpdateFlags(flagsp, ci, v ? 1u : 0u, _w + 2, vsc);
                 }
-                this.flags[flagsp] |= (T1)((uint)T1.PI_THIS << (ci * 3));
+                flg[flagsp] |= (T1)((uint)T1.PI_THIS << (ci * 3));
             }
         }
 
@@ -5868,7 +5960,10 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void DecClnpassStep(int flagsp, int datap, int oneplushalf, int ci, bool vsc)
         {
-            T1 flags = this.flags[flagsp];
+            int zcOrient = _mqc.lut_ctxno_zc_orient;
+            T1[] flg = this.flags; // local copy: lets the JIT keep the array in a register
+            int[] dat = _data;
+            T1 flags = flg[flagsp];
             //opj_t1_dec_clnpass_step_macro
             //(check_flags,  partial,   flags, flagsp, flags_stride,  data, data_stride, ci, mqc,      curctx, ..., oneplushalf, vsc)
             //   OPJ_TRUE, OPJ_FALSE, *flagsp, flagsp,   t1->w + 2U, datap,           0, ci, mqc, mqc->curctx, ..., oneplushalf, vsc
@@ -5882,7 +5977,7 @@ namespace OpenJpeg.Internal
                     {
                         if (!false)
                         {
-                            var ctxt1 = (T1_CTXNO)_mqc.Getctxno_zc((T1)((uint)flags >> (ci * 3)));
+                            var ctxt1 = (T1_CTXNO)T1Luts.Getctxno_zc(zcOrient, (T1)((uint)flags >> (ci * 3)));
                             _mqc.Setcurctx(ctxt1); //<- opj_t1_setcurctx macro
                             bool v = _mqc.Decode(); //<- opj_mqc_decode_macro
                             if (!v)
@@ -5890,12 +5985,12 @@ namespace OpenJpeg.Internal
                         }
                         {
                             T1 lu = T1Luts.Getctxtno_sc_or_spb_index(
-                                flags, this.flags[flagsp - 1], this.flags[flagsp + 1], ci);
+                                flags, flg[flagsp - 1], flg[flagsp + 1], ci);
                             _mqc.Setcurctx(T1Luts.Getctxno_sc(lu)); //<- opj_t1_setcurctx macro
                             bool v = _mqc.Decode(); //<- opj_mqc_decode_macro
                             v = v ^ T1Luts.Getspb(lu);
-                            _data[datap + ci * data_stride] = v ? -oneplushalf : oneplushalf;
-                            UpdateFlagsMacro(ref this.flags[flagsp], flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
+                            dat[datap + ci * data_stride] = NegateIf(v, oneplushalf);
+                            flg[flagsp] = UpdateFlagsMacro(flg, flg[flagsp], flagsp, ci, v ? 1u : 0u, flags_stride, vsc);
                         }
                     } while (false);
                 }
@@ -5907,40 +6002,46 @@ namespace OpenJpeg.Internal
         /// </remarks>
         void UpdateFlags(int flagsp, int ci, uint s, uint stride, bool vsc)
         {
-            UpdateFlagsMacro(ref flags[flagsp], flagsp, ci, s, stride, vsc);
+            flags[flagsp] = UpdateFlagsMacro(this.flags, flags[flagsp], flagsp, ci, s, stride, vsc);
         }
 
         /// <remarks>
         /// 2.5 - opj_t1_update_flags_macro
         /// </remarks>
-        void UpdateFlagsMacro(ref T1 flags, int flagsp, int ci, uint s, uint stride, bool vsc)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static T1 UpdateFlagsMacro(T1[] flg, T1 flags, int flagsp, int ci, uint s, uint stride, bool vsc)
         {
+            // Takes and returns the flags value instead of a ref, so callers can keep it in a register.
+            // It never writes flg[flagsp] itself, only the neighbours.
+
             // East
-            this.flags[flagsp - 1] |= (T1)((uint)T1.SIGMA_5 << (3 * ci));
+            flg[flagsp - 1] |= (T1)((uint)T1.SIGMA_5 << (3 * ci));
 
             // Mark target as significant
             flags |= (T1)(((s << (int)T1.CHI_1_I) | (uint)T1.SIGMA_4) << (3 * ci));
 
             // West
-            this.flags[flagsp + 1] |= (T1)((uint)T1.SIGMA_3 << (3 * ci));
+            flg[flagsp + 1] |= (T1)((uint)T1.SIGMA_3 << (3 * ci));
 
             // North-west, north, north-east
             if (ci == 0 && !vsc)
             {
                 int north = flagsp - (int)stride;
-                this.flags[north] |= (T1)(s << (int)T1.CHI_5_I) | T1.SIGMA_16;
-                this.flags[north - 1] |= T1.SIGMA_17;
-                this.flags[north + 1] |= T1.SIGMA_15;
+                flg[north] |= (T1)(s << (int)T1.CHI_5_I) | T1.SIGMA_16;
+                flg[north - 1] |= T1.SIGMA_17;
+                flg[north + 1] |= T1.SIGMA_15;
             }
 
             // South-west, south, south-east
             if (ci == 3)
             {
                 int south = flagsp + (int)stride;
-                this.flags[south] |= (T1)(s << (int)T1.CHI_0_I) | T1.SIGMA_1;
-                this.flags[south - 1] |= T1.SIGMA_2;
-                this.flags[south + 1] |= T1.SIGMA_0;
+                flg[south] |= (T1)(s << (int)T1.CHI_0_I) | T1.SIGMA_1;
+                flg[south - 1] |= T1.SIGMA_2;
+                flg[south + 1] |= T1.SIGMA_0;
             }
+
+            return flags;
         }
 
         /// <summary>
@@ -5962,7 +6063,7 @@ namespace OpenJpeg.Internal
 
                 if (new_datasize > datasize)
                     _data = new int[new_datasize];
-                else
+                else if (_data != null) // null on a fresh instance with an empty code-block (C: memset of 0 bytes)
                     Array.Clear(_data, 0, new_datasize);
             }
 
@@ -5998,7 +6099,7 @@ namespace OpenJpeg.Internal
 
                 if (new_datasize > datasize)
                     _data = new int[new_datasize];
-                else
+                else if (_data != null) // null on a fresh instance with an empty code-block (C: memset of 0 bytes)
                     Array.Clear(_data, 0, new_datasize);
             }
 
@@ -6047,8 +6148,6 @@ namespace OpenJpeg.Internal
             _w = (uint) w;
             _h = (uint) h;
         }
-
-        #region Helper classes
 
         private static uint to_smr(int x)
         {
@@ -6157,7 +6256,5 @@ namespace OpenJpeg.Internal
                 this.set_ret = set_ret;
             }
         }
-
-        #endregion
     }
 }

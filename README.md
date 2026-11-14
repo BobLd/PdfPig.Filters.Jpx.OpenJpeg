@@ -81,6 +81,12 @@ using (var doc = PdfDocument.Open("test.pdf", parsingOption))
 
 ```
 
+## Platform notes
+- Decoded samples are bit-identical to upstream OpenJPEG on 64-bit runtimes (checked on x64, .NET 8 and
+  .NET Framework). On 32-bit .NET Framework the JIT uses x87 floating point, which can keep float intermediates at
+  higher precision: lossy (9/7 wavelet, irreversible colour transform) images may then differ from upstream in the
+  last bit. This has not been tested. The lossless (5/3) decoding path itself uses integer arithmetic only.
+
 ## Development
 - `UglyToad.PdfPig.Filters.Jpx.OpenJpeg/OpenJPEG/` holds the port. `UPSTREAM.md` there records the upstream OpenJPEG commit
   it is synced to, the C to C# file map, and the deliberate differences.

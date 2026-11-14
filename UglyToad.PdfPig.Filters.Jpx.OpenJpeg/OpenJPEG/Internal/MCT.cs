@@ -145,15 +145,9 @@ namespace OpenJpeg.Internal
                 r.I = c0[i];
                 g.I = c1[i];
                 b.I = c2[i];
-#if !TEST_MATH_MODE
                 y.F = 0.299f * r.F + 0.587f * g.F + 0.114f * b.F;
                 u.F = -0.16875f * r.F - 0.331260f * g.F + 0.5f * b.F;
                 v.F = 0.5f * r.F - 0.41869f * g.F - 0.08131f * b.F;
-#else
-                y.F = (float)((float)(0.299f * r.F) + (float)(0.587f * g.F)) + (float)(0.114f * b.F);
-                u.F = (float)((float)(-0.16875f * r.F) - (float)(0.331260f * g.F)) + (float)(0.5f * b.F);
-                v.F = (float)((float)(0.5f * r.F) - (float)(0.41869f * g.F)) - (float)(0.08131f * b.F);
-#endif
                 c0[i] = y.I;
                 c1[i] = u.I;
                 c2[i] = v.I;
@@ -198,7 +192,7 @@ namespace OpenJpeg.Internal
         ///
         /// There's a SSE2 variant of this algo. 
         /// </remarks>
-        internal static void Decode(int[] c0, int[] c1, int[] c2, int n)
+        internal static void Decode(Span<int> c0, Span<int> c1, Span<int> c2, int n)
         {
             int i = 0;
 #if NET7_0_OR_GREATER
@@ -208,13 +202,13 @@ namespace OpenJpeg.Internal
                 int V = Vector<int>.Count;
                 for (; i <= n - V; i += V)
                 {
-                    var y = new Vector<int>(c0, i);
-                    var u = new Vector<int>(c1, i);
-                    var v = new Vector<int>(c2, i);
+                    var y = new Vector<int>(c0.Slice(i));
+                    var u = new Vector<int>(c1.Slice(i));
+                    var v = new Vector<int>(c2.Slice(i));
                     var g = y - ((u + v) >> 2);
-                    (v + g).CopyTo(c0, i);
-                    g.CopyTo(c1, i);
-                    (u + g).CopyTo(c2, i);
+                    (v + g).CopyTo(c0.Slice(i));
+                    g.CopyTo(c1.Slice(i));
+                    (u + g).CopyTo(c2.Slice(i));
                 }
             }
 #endif
@@ -242,7 +236,7 @@ namespace OpenJpeg.Internal
         /// <param name="c1">Samples for red chrominance component</param>
         /// <param name="c2">Samples for blue chrominance component</param>
         /// <param name="n">Number of samples for each component</param>
-        internal static void DecodeReal(int[] c0, int[] c1, int[] c2, int n)
+        internal static void DecodeReal(Span<int> c0, Span<int> c1, Span<int> c2, int n)
         {
             IntOrFloat y = new IntOrFloat();
             IntOrFloat u = new IntOrFloat();
@@ -252,14 +246,13 @@ namespace OpenJpeg.Internal
             IntOrFloat b = new IntOrFloat();
 
             int i = 0;
-#if !TEST_MATH_MODE
             // Vector version of the loop below, same operations in the same order, so bit-identical.
             // The int arrays hold float bits at this stage.
             if (Vector.IsHardwareAccelerated)
             {
-                var y0 = MemoryMarshal.Cast<int, Vector<float>>(c0.AsSpan(0, n));
-                var u1 = MemoryMarshal.Cast<int, Vector<float>>(c1.AsSpan(0, n));
-                var v2 = MemoryMarshal.Cast<int, Vector<float>>(c2.AsSpan(0, n));
+                var y0 = MemoryMarshal.Cast<int, Vector<float>>(c0.Slice(0, n));
+                var u1 = MemoryMarshal.Cast<int, Vector<float>>(c1.Slice(0, n));
+                var v2 = MemoryMarshal.Cast<int, Vector<float>>(c2.Slice(0, n));
                 var crv = new Vector<float>(1.402f);
                 var cgu = new Vector<float>(0.34413f);
                 var cgv = new Vector<float>(0.71414f);
@@ -275,7 +268,6 @@ namespace OpenJpeg.Internal
                 }
                 i = y0.Length * Vector<float>.Count;
             }
-#endif
 
             //C# Liberal application of (float) to reduce math precision to the same as the org. impl
             for (; i < n; ++i)
@@ -283,30 +275,9 @@ namespace OpenJpeg.Internal
                 y.I = c0[i];
                 u.I = c1[i];
                 v.I = c2[i];
-#if !TEST_MATH_MODE
                 r.F = y.F + (v.F * 1.402f);
                 g.F = y.F - (u.F * 0.34413f) - (v.F * 0.71414f);
                 b.F = y.F + (u.F * 1.772f);
-#else
-                r.F = y.F + (float)(v.F * 1.402f);
-                g.F = y.F - (float)(u.F * 0.34413f) - (float)(v.F * 0.71414f);
-                {
-                    //c# This isn't more correct than the formula above, the goal
-                    //   here is to have the exact same result as the c impl. 
-                    //
-                    //   This lets us do a byte for byte comparison check, with the
-                    //   caviat that we're comparing against the result of a MSVC
-                    //   build of the c libary.
-                    //
-                    //   Other builds may give different results.
-                    g.F = y.F;
-                    float tmp = u.F * 0.344130009f;
-                    g.F -= tmp;
-                    tmp = v.F * 0.714139998f;
-                    g.F -= tmp;
-                }
-                b.F = y.F + (float)(u.F * 1.772f);
-#endif
                 c0[i] = r.I;
                 c1[i] = g.I;
                 c2[i] = b.I;
@@ -325,6 +296,149 @@ namespace OpenJpeg.Internal
                 //    i = i;
                 //}
             }
+        }
+
+        /// <summary>DC level shift of one component: add Shift, clamp to Min .. Max (TileCoder.DcLevelShiftDecode).</summary>
+        internal readonly struct DcShift
+        {
+            internal readonly int Shift, Min, Max;
+            internal DcShift(int shift, int min, int max) { Shift = shift; Min = min; Max = max; }
+        }
+
+        // The two kernels below run once per tile, so under tiering a single-tile image never reaches tier-1 code:
+        // fully optimised from the first call. Plain loops, nothing for PGO.
+
+        /// <summary>
+        /// <see cref="Decode"/> followed by the reversible DC level shift of the three components, in one pass over
+        /// the samples instead of two. Same integer operations per sample, so the same values. Not in upstream.
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+#endif
+        internal static void DecodeDcShift(Span<int> c0, Span<int> c1, Span<int> c2, int n, DcShift s0, DcShift s1, DcShift s2)
+        {
+            int i = 0;
+#if NET7_0_OR_GREATER
+            if (Vector.IsHardwareAccelerated)
+            {
+                int V = Vector<int>.Count;
+                Vector<int> sh0 = new(s0.Shift), mn0 = new(s0.Min), mx0 = new(s0.Max);
+                Vector<int> sh1 = new(s1.Shift), mn1 = new(s1.Min), mx1 = new(s1.Max);
+                Vector<int> sh2 = new(s2.Shift), mn2 = new(s2.Min), mx2 = new(s2.Max);
+                for (; i <= n - V; i += V)
+                {
+                    var y = new Vector<int>(c0.Slice(i));
+                    var u = new Vector<int>(c1.Slice(i));
+                    var v = new Vector<int>(c2.Slice(i));
+                    var g = y - ((u + v) >> 2);
+                    Vector.Min(Vector.Max(v + g + sh0, mn0), mx0).CopyTo(c0.Slice(i));
+                    Vector.Min(Vector.Max(g + sh1, mn1), mx1).CopyTo(c1.Slice(i));
+                    Vector.Min(Vector.Max(u + g + sh2, mn2), mx2).CopyTo(c2.Slice(i));
+                }
+            }
+#endif
+            for (; i < n; ++i)
+            {
+                int y = c0[i];
+                int u = c1[i];
+                int v = c2[i];
+                int g = y - ((u + v) >> 2);
+                c0[i] = MyMath.int_clamp(v + g + s0.Shift, s0.Min, s0.Max);
+                c1[i] = MyMath.int_clamp(g + s1.Shift, s1.Min, s1.Max);
+                c2[i] = MyMath.int_clamp(u + g + s2.Shift, s2.Min, s2.Max);
+            }
+        }
+
+        /// <summary>
+        /// <see cref="DecodeReal"/> followed by the irreversible DC level shift of the three components
+        /// (clamp(round_half_even(f) + shift, min, max)), in one pass over the samples instead of two. Same float
+        /// operations in the same order, and the same rounding as TileCoder.DcShiftFloat: a vector of 8 takes the
+        /// scalar formula when one of its values is outside |f| &lt; 2^22 (or NaN). Not in upstream. For precisions
+        /// of 24 bits or less.
+        /// </summary>
+#if NETCOREAPP3_0_OR_GREATER
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+#endif
+        internal static void DecodeRealDcShift(Span<int> c0, Span<int> c1, Span<int> c2, int n, DcShift s0, DcShift s1, DcShift s2)
+        {
+            int i = 0;
+            if (Vector.IsHardwareAccelerated)
+            {
+                int V = Vector<float>.Count;
+                var y0 = MemoryMarshal.Cast<int, Vector<float>>(c0.Slice(0, n));
+                var u1 = MemoryMarshal.Cast<int, Vector<float>>(c1.Slice(0, n));
+                var v2 = MemoryMarshal.Cast<int, Vector<float>>(c2.Slice(0, n));
+                var o0 = MemoryMarshal.Cast<int, Vector<int>>(c0.Slice(0, n));
+                var o1 = MemoryMarshal.Cast<int, Vector<int>>(c1.Slice(0, n));
+                var o2 = MemoryMarshal.Cast<int, Vector<int>>(c2.Slice(0, n));
+                var crv = new Vector<float>(1.402f);
+                var cgu = new Vector<float>(0.34413f);
+                var cgv = new Vector<float>(0.71414f);
+                var cbu = new Vector<float>(1.772f);
+                var magic = new Vector<float>(12582912f); // 1.5 * 2^23
+                var limit = new Vector<float>(4194304f);  // 2^22
+                Vector<int> sh0 = new(s0.Shift), mn0 = new(s0.Min), mx0 = new(s0.Max);
+                Vector<int> sh1 = new(s1.Shift), mn1 = new(s1.Min), mx1 = new(s1.Max);
+                Vector<int> sh2 = new(s2.Shift), mn2 = new(s2.Min), mx2 = new(s2.Max);
+                for (int k = 0; k < y0.Length; k++)
+                {
+                    var vy = y0[k];
+                    var vu = u1[k];
+                    var vv = v2[k];
+                    var r = vy + (vv * crv);
+                    var g = vy - (vu * cgu) - (vv * cgv);
+                    var b = vy + (vu * cbu);
+                    if (Vector.LessThanAll(Vector.Abs(r), limit) && Vector.LessThanAll(Vector.Abs(g), limit)
+                        && Vector.LessThanAll(Vector.Abs(b), limit))
+                    {
+                        o0[k] = Vector.Min(Vector.Max(Vector.ConvertToInt32((r + magic) - magic) + sh0, mn0), mx0);
+                        o1[k] = Vector.Min(Vector.Max(Vector.ConvertToInt32((g + magic) - magic) + sh1, mn1), mx1);
+                        o2[k] = Vector.Min(Vector.Max(Vector.ConvertToInt32((b + magic) - magic) + sh2, mn2), mx2);
+                    }
+                    else
+                    {
+                        for (int l = 0, at = k * V; l < V; l++, at++)
+                        {
+                            c0[at] = DcShiftFloat(r[l], s0);
+                            c1[at] = DcShiftFloat(g[l], s1);
+                            c2[at] = DcShiftFloat(b[l], s2);
+                        }
+                    }
+                }
+                i = y0.Length * V;
+            }
+
+            IntOrFloat y = new IntOrFloat();
+            IntOrFloat u = new IntOrFloat();
+            IntOrFloat v = new IntOrFloat();
+            for (; i < n; ++i)
+            {
+                y.I = c0[i];
+                u.I = c1[i];
+                v.I = c2[i];
+                c0[i] = DcShiftFloat(y.F + (v.F * 1.402f), s0);
+                c1[i] = DcShiftFloat(y.F - (u.F * 0.34413f) - (v.F * 0.71414f), s1);
+                c2[i] = DcShiftFloat(y.F + (u.F * 1.772f), s2);
+            }
+        }
+
+        // Array overloads of the four decoders above: FusedMctDcShiftTest calls them by reflection, which cannot pass a Span.
+        internal static void Decode(int[] c0, int[] c1, int[] c2, int n) => Decode(c0.AsSpan(), c1.AsSpan(), c2.AsSpan(), n);
+        internal static void DecodeReal(int[] c0, int[] c1, int[] c2, int n) => DecodeReal(c0.AsSpan(), c1.AsSpan(), c2.AsSpan(), n);
+        internal static void DecodeDcShift(int[] c0, int[] c1, int[] c2, int n, DcShift s0, DcShift s1, DcShift s2) =>
+            DecodeDcShift(c0.AsSpan(), c1.AsSpan(), c2.AsSpan(), n, s0, s1, s2);
+        internal static void DecodeRealDcShift(int[] c0, int[] c1, int[] c2, int n, DcShift s0, DcShift s1, DcShift s2) =>
+            DecodeRealDcShift(c0.AsSpan(), c1.AsSpan(), c2.AsSpan(), n, s0, s1, s2);
+
+        /// <summary>The scalar irreversible DC level shift of TileCoder.DcShiftFloat, for one value.</summary>
+        static int DcShiftFloat(float f, DcShift s)
+        {
+            if (f > int.MaxValue)
+                return s.Max;
+            if (f < int.MinValue)
+                return s.Min;
+            // Banker's rounding (round half to even), as lrintf; addition on int64 to avoid overflows
+            return (int)MyMath.int64_clamp((long)Math.Round(f) + s.Shift, s.Min, s.Max);
         }
     }
 

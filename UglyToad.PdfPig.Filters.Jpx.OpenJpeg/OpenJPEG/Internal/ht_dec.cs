@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
 namespace OpenJpeg.Internal
 {
@@ -45,14 +45,19 @@ namespace OpenJpeg.Internal
         /// <remarks>
         /// https://stackoverflow.com/questions/10439242/count-leading-zeroes-in-an-int32
         /// </remarks>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         internal static uint population_count(uint x)
         {
+#if NETCOREAPP3_0_OR_GREATER
+            return (uint)System.Numerics.BitOperations.PopCount(x); // popcnt, like upstream's __builtin_popcount
+#else
             x -= ((x >> 1) & 0x55555555);
             x = (((x >> 2) & 0x33333333) + (x & 0x33333333));
             x = (((x >> 4) + x) & 0x0f0f0f0f);
             x += (x >> 8);
             x += (x >> 16);
             return (x & 0x0000003f);
+#endif
         }
 
         /// <summary>
@@ -64,8 +69,12 @@ namespace OpenJpeg.Internal
         /// Alternative: System.Numerics.BitOperations.LeadingZeroCount, 
         ///              avalible from .net 5.0
         /// </remarks>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         internal static uint count_leading_zeros(uint x)
         {
+#if NETCOREAPP3_0_OR_GREATER
+            return (uint)System.Numerics.BitOperations.LeadingZeroCount(x); // lzcnt; 32 for 0, like the code below
+#else
             const uint numIntBits = sizeof(uint) * 8; //compile time constant
                                                       //do the smearing
             x |= x >> 1;
@@ -80,6 +89,7 @@ namespace OpenJpeg.Internal
             x += x >> 8;
             x += x >> 16;
             return numIntBits - (x & 0x0000003f); //subtract # of 1s from 32
+#endif
         }
 
         /// <summary>

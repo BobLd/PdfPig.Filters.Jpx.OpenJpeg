@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!-- Stopwatch harness for NativeAOT (BenchmarkDotNet 0.15.8 cannot build NativeAOT jobs with the .NET 10 SDK here).
+	     dotnet publish benchmarks/aot -c Release -r win-x64   then run the published AotDecode.exe -->
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<IsPackable>false</IsPackable>
+		<PublishAot>true</PublishAot>
+		<OptimizationPreference>Speed</OptimizationPreference>
+		<IlcInstructionSet>native</IlcInstructionSet>
+		<InvariantGlobalization>true</InvariantGlobalization>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\..\UglyToad.PdfPig.Filters.Jpx.OpenJpeg\UglyToad.PdfPig.Filters.Jpx.OpenJpeg.csproj" />
+		<Compile Include="..\..\UglyToad.PdfPig.Filters.Jpx.OpenJpeg.Benchmarks\Samples.cs" Link="Samples.cs" />
+		<None Include="..\..\UglyToad.PdfPig.Filters.Jpx.OpenJpeg.Benchmarks\Data\*.jpx" Link="Data\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+	</ItemGroup>
+
+</Project>

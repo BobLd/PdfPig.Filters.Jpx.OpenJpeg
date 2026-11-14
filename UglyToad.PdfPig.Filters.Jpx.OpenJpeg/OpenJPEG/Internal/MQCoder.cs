@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -29,8 +28,9 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
+
 using System;
+using System.Runtime.CompilerServices;
 using System.Diagnostics;
 
 namespace OpenJpeg.Internal
@@ -45,19 +45,17 @@ namespace OpenJpeg.Internal
     /// </summary>
     internal sealed class MQCoder
     {
-        #region Variables and properties
-
         const uint BYPASS_CT_INIT = 0xDEADBEEF;
 
         /// <summary>
         /// Temporary buffer where bits are coded or decoded
         /// </summary>
-        uint c;
+        internal uint c;
 
         /// <summary>
         /// Number of bits already read or free to write
         /// </summary>
-        uint ct;
+        internal uint ct;
 
         /// <summary>
         /// Maximum length to decode
@@ -77,7 +75,7 @@ namespace OpenJpeg.Internal
         /// <summary>
         /// aaaaaaaaaaa
         /// </summary>
-        uint a;
+        internal uint a;
 
         /// <summary>
         /// Read position in the data array
@@ -89,32 +87,14 @@ namespace OpenJpeg.Internal
         /// </summary>
         internal uint _end_of_byte_stream_counter;
 
-        /// <remarks>
-        /// C# implementation note:
-        /// As long as no indexing is done into the "second"
-        /// dimension of this array, it will work as in the
-        /// C++ code.
-        /// 
-        /// If it turns out this is needed, somehow store the
-        /// index of the MQCState, and use that to look up in
-        /// the mqc_states array.
-        /// 
-        /// The important bit here is anyway that one can hand
-        /// out a "ptr", and if that ptr is updated said update
-        /// is reflected in this array.
-        /// </remarks>
-        internal Ptr<MQCState>[] ctxs = new Ptr<MQCState>[Constants.MQC_NUMCTXS];
+        /// <summary>
+        /// State of each context, as its packed <see cref="MQCState.Table"/> entry. Upstream keeps a pointer
+        /// to an opj_mqc_state_t per context; holding the entry itself means the common decode path is one load.
+        /// </summary>
+        internal readonly uint[] ctxs = new uint[Constants.MQC_NUMCTXS];
 
-        /// <summary>Current context</summary>
-        /// <remarks>
-        /// C# This is a "pointer" into ctxs. However, this implementation
-        ///    has it be a Ptr class. This works since it is effectivly a
-        ///    pointer into the ctxs array.
-        ///    
-        ///    Note, whenever curctx is changed, the new Ptr must be fetched 
-        ///    from ctsx.
-        /// </remarks>
-        internal Ptr<MQCState> curctx;
+        /// <summary>Current context, an index into <see cref="ctxs"/> (upstream: mqc->curctx).</summary>
+        internal int curctx;
 
         /// <summary>
         /// lut_ctxno_zc shifted by (1 << 9) * bandno
@@ -126,18 +106,11 @@ namespace OpenJpeg.Internal
 
         internal int NumBytes { get { return _bp - _start; } }
 
-        #endregion
-
-        #region Init
-
         //C# - Creates the ctxs "struct". Might be overdesigned, as this
         //     was some of the first code I converted and I was usure whet
         //     c pointer peculiarities I needed to support.
         internal MQCoder()
         {
-            for (int c = 0; c < ctxs.Length; c++)
-                ctxs[c] = new Ptr<MQCState>();
-            curctx = ctxs[0];
         }
 
         /// <remarks>
@@ -281,7 +254,17 @@ namespace OpenJpeg.Internal
             a = 0x8000;
         }
 
-        #endregion
+        /// <summary>
+        /// Set the current context used for coding/decoding
+        /// </summary>
+        /// <param name="ctxno">Number that identifies the context</param>
+        /// <remarks>
+        /// 2.5 - opj_mqc_setcurctx
+        /// 
+        /// Org. impl. is a macro
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void Setcurctx(T1_CTXNO i) { curctx = (int)i; }
 
         /// <summary>
         /// Set the current context used for coding/decoding
@@ -292,18 +275,8 @@ namespace OpenJpeg.Internal
         /// 
         /// Org. impl. is a macro
         /// </remarks>
-        internal void Setcurctx(T1_CTXNO i) { curctx = ctxs[(int) i]; }
-
-        /// <summary>
-        /// Set the current context used for coding/decoding
-        /// </summary>
-        /// <param name="ctxno">Number that identifies the context</param>
-        /// <remarks>
-        /// 2.5 - opj_mqc_setcurctx
-        /// 
-        /// Org. impl. is a macro
-        /// </remarks>
-        internal void Setcurctx(int ctxno) { curctx = ctxs[ctxno]; }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void Setcurctx(int ctxno) { curctx = ctxno; }
 
         /// <summary>
         /// Fill mqc->c with 1's for flushing
@@ -382,7 +355,7 @@ namespace OpenJpeg.Internal
         //2.5 - opj_mqc_segmark_enc
         internal void SegmarkEnc()
         {
-            curctx = ctxs[18];
+            curctx = 18;
 
             for (int i = 1; i < 5; i++)
             {
@@ -436,7 +409,7 @@ namespace OpenJpeg.Internal
         //2.5 - opj_mqc_encode_macro
         internal void Encode(bool d)
         {
-            if (curctx.P.mps == d)
+            if (MQCState.Mps(ctxs[curctx]) == d)
                 Codemps();
             else
                 Codelps();
@@ -445,31 +418,35 @@ namespace OpenJpeg.Internal
         //2.5 - opj_mqc_codelps_macro
         void Codelps()
         {
-            a -= curctx.P.qeval;
-            if (a < curctx.P.qeval)
-                c += curctx.P.qeval;
+            uint e = ctxs[curctx];
+            uint qeval = e & 0xFFFF;
+            a -= qeval;
+            if (a < qeval)
+                c += qeval;
             else
-                a = curctx.P.qeval;
-            curctx.P = curctx.P.nlps;
+                a = qeval;
+            ctxs[curctx] = MQCState.Nlps(e);
             Renorme();
         }
 
         //2.5 - opj_mqc_codemps_macro
         void Codemps()
         {
-            a -= curctx.P.qeval;
+            uint e = ctxs[curctx];
+            uint qeval = e & 0xFFFF;
+            a -= qeval;
             if ((a & 0x8000) == 0)
             {
-                if (a < curctx.P.qeval)
-                    a = curctx.P.qeval;
+                if (a < qeval)
+                    a = qeval;
                 else
-                    c += curctx.P.qeval;
-                curctx.P = curctx.P.nmps;
+                    c += qeval;
+                ctxs[curctx] = MQCState.Nmps(e);
                 Renorme();
             }
             else
             {
-                c += curctx.P.qeval;
+                c += qeval;
             }
         }
 
@@ -521,36 +498,184 @@ namespace OpenJpeg.Internal
             return ((c >> (int)ct) & 0x01) == 0x01;
         }
 
-        //2.5 - opj_mqc_decode_macro
+        //2.5 - opj_mqc_decode_macro, with opj_mqc_mpsexchange_macro / opj_mqc_lpsexchange_macro inlined
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal bool Decode()
         {
+            uint[] states = ctxs;
+            int cx = curctx;
+            uint e = states[cx];
+            uint qeval = e & 0xFFFF;
+            bool mps = MQCState.Mps(e);
             bool d;
-            a -= curctx.P.qeval;
-            if ((c >> 16) < curctx.P.qeval)
+
+            a -= qeval;
+            if ((c >> 16) < qeval)
             {
-                d = LpsExchange();
+                // LPS exchange
+                if (a < qeval)
+                {
+                    d = mps;
+                    states[cx] = MQCState.Nmps(e);
+                }
+                else
+                {
+                    d = !mps;
+                    states[cx] = MQCState.Nlps(e);
+                }
+                a = qeval;
                 Renormd();
             }
             else
             {
-                c -= curctx.P.qeval << 16;
+                c -= qeval << 16;
                 if ((a & 0x8000) == 0)
                 {
-                    d = MpsExchange();
+                    // MPS exchange
+                    if (a < qeval)
+                    {
+                        d = !mps;
+                        states[cx] = MQCState.Nlps(e);
+                    }
+                    else
+                    {
+                        d = mps;
+                        states[cx] = MQCState.Nmps(e);
+                    }
                     Renormd();
                 }
                 else
                 {
-                    d = curctx.P.mps;
+                    d = mps;
                 }
             }
 
             return d;
         }
 
+        // The hot T1 passes copy a, c and ct into an MqcRegs local (upstream's DOWNLOAD_MQC_VARIABLES), decode with
+        // Decode(ref MqcRegs, ...), and copy them back (UPLOAD_MQC_VARIABLES). The copies are plain field assignments:
+        // a non-inlined call returning the struct would make the JIT keep it in memory.
+
+        /// <summary>
+        /// <see cref="Decode()"/> on downloaded registers. Same arithmetic, so the same decoded bits.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool Decode(ref MqcRegs r, uint[] states, int cx, MQCoder mqc)
+        {
+            uint e = states[cx];
+            uint qeval = e & 0xFFFF;
+            bool mps = MQCState.Mps(e);
+            bool d;
+
+            r.a -= qeval;
+            if ((r.c >> 16) < qeval)
+            {
+                // LPS exchange: LPS unless a < qeval. Chosen without a branch (a < qeval depends on the data).
+                int lps = r.a >= qeval ? 1 : 0;
+                d = mps ^ (lps != 0);
+                states[cx] = MQCState.Table[(e >> (16 + 8 * lps)) & 0x7F];
+                r.a = qeval;
+                Renormd(ref r, mqc);
+            }
+            else
+            {
+                r.c -= qeval << 16;
+                if ((r.a & 0x8000) == 0)
+                {
+                    // MPS exchange: MPS unless a < qeval
+                    int lps = r.a < qeval ? 1 : 0;
+                    d = mps ^ (lps != 0);
+                    states[cx] = MQCState.Table[(e >> (16 + 8 * lps)) & 0x7F];
+                    Renormd(ref r, mqc);
+                }
+                else
+                {
+                    d = mps;
+                }
+            }
+
+            return d;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void Renormd(ref MqcRegs r, MQCoder mqc)
+        {
+#if NETCOREAPP3_0_OR_GREATER
+            int n = System.Numerics.BitOperations.LeadingZeroCount(r.a) - 16;
+            if ((uint)n <= r.ct)
+            {
+                r.a <<= n;
+                r.c <<= n;
+                r.ct -= (uint)n;
+                return;
+            }
+#endif
+            do
+            {
+                if (r.ct == 0)
+                {
+                    ulong v = mqc.ByteIn(r.c);
+                    r.c = (uint)v;
+                    r.ct = (uint)(v >> 32);
+                }
+                r.a <<= 1;
+                r.c <<= 1;
+                r.ct--;
+            } while (r.a < 0x8000);
+        }
+
+        /// <summary>
+        /// <see cref="ByteIn()"/> for downloaded registers: takes c, returns the new c in the low 32 bits and the
+        /// new ct in the high 32 bits, so the caller's registers are never passed by reference.
+        /// </summary>
+        // Inlined although rare (once per 8 bits): a call in the T1 passes clobbers the caller-saved registers, so the
+        // JIT kept the pass's loop variables on the stack for the whole loop. Inlined, the passes are 5-9% faster.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        ulong ByteIn(uint c)
+        {
+            uint ct;
+            uint l_c = _data[_bp + 1];
+            if (_data[_bp] == 0xff)
+            {
+                if (l_c > 0x8f)
+                {
+                    c += 0xff00;
+                    ct = 8;
+                    _end_of_byte_stream_counter++;
+                }
+                else
+                {
+                    _bp++;
+                    c += l_c << 9;
+                    ct = 7;
+                }
+            }
+            else
+            {
+                _bp++;
+                c += l_c << 8;
+                ct = 8;
+            }
+            return c | ((ulong)ct << 32);
+        }
+
         //2.5 - opj_mqc_renormd_macro
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void Renormd()
         {
+#if NETCOREAPP3_0_OR_GREATER
+            // The loop below runs exactly n = lzcnt(a) - 16 times (1 <= a < 0x8000 here). When no byte
+            // is needed meanwhile (n <= ct), all n steps collapse into one shift: same result.
+            int n = System.Numerics.BitOperations.LeadingZeroCount(a) - 16;
+            if ((uint)n <= ct)
+            {
+                a <<= n;
+                c <<= n;
+                ct -= (uint)n;
+                return;
+            }
+#endif
             do
             {
                 if (ct == 0) ByteIn();
@@ -558,43 +683,6 @@ namespace OpenJpeg.Internal
                 c <<= 1;
                 ct--;
             } while (a < 0x8000);
-        }
-
-        //2.5 - opj_mqc_mpsexchange_macro
-        bool MpsExchange()
-        {
-            bool d;
-            if (a < curctx.P.qeval)
-            {
-                d = !curctx.P.mps;
-                curctx.P = curctx.P.nlps;
-            }
-            else
-            {
-                d = curctx.P.mps;
-                curctx.P = curctx.P.nmps;
-            }
-
-            return d;
-        }
-
-        //2.5 - opj_mqc_lpsexchange_macro
-        bool LpsExchange()
-        {
-            bool d;
-            if (a < curctx.P.qeval)
-            {
-                a = curctx.P.qeval;
-                d = curctx.P.mps;
-                curctx.P = curctx.P.nmps;
-            }
-            else
-            {
-                a = curctx.P.qeval;
-                d = !curctx.P.mps;
-                curctx.P = curctx.P.nlps;
-            }
-            return d;
         }
 
         //C# - This method dosn't exist in 2.5, but the equivalent code it identical.
@@ -622,14 +710,15 @@ namespace OpenJpeg.Internal
         //2.5 - opj_mqc_resetstates
         internal void ResetStates()
         {
-            for (int i = 0; i < Constants.MQC_NUMCTXS; i++)
-                ctxs[i].P = MQCState.mqc_states[0];
+            uint s0 = MQCState.Table[0];
+            for (int i = 0; i < ctxs.Length; i++)
+                ctxs[i] = s0;
         }
 
         //2.5 - opj_mqc_setstate
         internal void SetState(T1_CTXNO ctxno, int msb, int prob)
         {
-            ctxs[(int)ctxno].P = MQCState.mqc_states[msb + (prob << 1)];
+            ctxs[(int)ctxno] = MQCState.Table[msb + (prob << 1)];
         }
 
         /// <summary>
@@ -691,6 +780,7 @@ namespace OpenJpeg.Internal
         /// <remarks>
         /// 2.5 - opj_mqc_bytein_macro
         /// </remarks>
+        [MethodImpl(MethodImplOptions.NoInlining)] // rare: once per 8 decoded bits
         void ByteIn()
         {
             // Given opj_mqc_init_dec() we know that at some point we will
@@ -731,59 +821,48 @@ namespace OpenJpeg.Internal
     }
 
     /// <summary>
-    /// Defines the state of a context
+    /// MQ decoder registers held in a local by the T1 passes, so the JIT can keep them in registers.
+    /// The current context is not part of it: it is passed to each decode, which keeps it short-lived.
     /// </summary>
-    internal class MQCState
+    internal struct MqcRegs
+    {
+        internal uint a, c, ct;
+    }
+
+    /// <summary>
+    /// The 47 x 2 MQ coder states (upstream mqc_states). Index = state * 2 + MPS, so the MPS is bit 0.
+    /// </summary>
+    internal static class MQCState
     {
         /// <summary>
-        /// The probability of the Least Probable Symbol 
-        /// (0.75->0x8000, 1.5->0xffff)
+        /// Packed per state: Qe in bits 0-15, next state index on MPS in bits 16-22, next state index on LPS in
+        /// bits 24-30, MPS in bit 31. 128 entries (94 used) so that a 7-bit index needs no bounds check.
         /// </summary>
-        internal uint qeval;
+        internal static readonly uint[] Table;
 
-        /// <summary>
-        /// The Most Probable Symbol
-        /// </summary>
-        internal bool mps;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool Mps(uint e) => (int)e < 0;
 
-        /// <summary>
-        /// Next state if the next encoded symbol is the MPS
-        /// </summary>
-        internal MQCState nmps;
+        /// <summary>Entry of the next state after an MPS (upstream: (*curctx)->nmps).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static uint Nmps(uint e) => Table[(e >> 16) & 0x7F];
 
-        /// <summary>
-        /// Next state if the next encoded symbol is the LPS
-        /// </summary>
-        internal MQCState nlps;
+        /// <summary>Entry of the next state after an LPS (upstream: (*curctx)->nlps).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static uint Nlps(uint e) => Table[(e >> 24) & 0x7F];
 
-        internal MQCState(uint q, bool m, MQCState nm, MQCState nl)
-        { qeval = q; mps = m; nmps = nm; nlps = nl; }
+        // Static constructor: runs after the mcqints initializer below (field initializers run in textual order).
+        static MQCState() { Table = BuildTable(); }
 
-        private MQCState(int q, int m)
-        { qeval = (uint)q; mps = m == 1; }
-
-        /// <summary>
-        /// This array defines all the possible states for a context.
-        /// </summary>
-        internal static MQCState[] mqc_states;
-        
-        /// <summary>
-        /// Builds up the mqc_states array
-        /// </summary>
-        static MQCState()
+        static uint[] BuildTable()
         {
-            mqc_states = new MQCState[47 * 2];
-
-            for (int c = 0; c < mqc_states.Length; c++)
-                mqc_states[c] = new MQCState(mcqints[c, 0], mcqints[c, 1]);
-
-            for (int c = 0; c < mqc_states.Length; c++)
+            var t = new uint[128];
+            for (int i = 0; i < mcqints.GetLength(0); i++)
             {
-                var mcq = mqc_states[c];
-                mcq.nmps = mqc_states[mcqints[c, 2]];
-                mcq.nlps = mqc_states[mcqints[c, 3]];
+                t[i] = (uint)mcqints[i, 0] | ((uint)mcqints[i, 2] << 16) | ((uint)mcqints[i, 3] << 24) |
+                       ((uint)mcqints[i, 1] << 31);
             }
-            mcqints = null;
+            return t;
         }
 
         /// <summary>

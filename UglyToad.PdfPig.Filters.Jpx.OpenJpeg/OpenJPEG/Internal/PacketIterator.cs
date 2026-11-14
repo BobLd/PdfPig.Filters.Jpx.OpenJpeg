@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,13 +29,11 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
-#region Using
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using OPJ_UINT32 = System.UInt32;
-#endregion
 
 namespace OpenJpeg.Internal
 {
@@ -46,8 +43,6 @@ namespace OpenJpeg.Internal
     /// </summary>
     internal sealed class PacketIterator
     {
-        #region Variables and properties
-
         /// <summary>
         /// The parent compression info obj.
         /// </summary>
@@ -129,16 +124,10 @@ namespace OpenJpeg.Internal
         uint tx0, ty0, tx1, ty1;
         uint x, y, dx, dy;
 
-        #endregion
-
-        #region Init
-
         private PacketIterator(CompressionInfo cinfo)
         {
             _cinfo = cinfo;
         }
-
-        #endregion
 
         //2.5 - opj_pi_update_encoding_parameters
         internal static void UpdateEncodingParameters(JPXImage image, CodingParameters cp, uint tile_no)

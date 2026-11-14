@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Runtime.InteropServices;
 
 namespace OpenJpeg.Internal
 {
@@ -51,7 +52,8 @@ namespace OpenJpeg.Internal
         {
             uint y, block_y;
             uint y_incr = 0;
-            IntOrFloat iof = new IntOrFloat();
+            // The blocks hold float bit patterns (upstream casts float* to int32*): copy bits, never convert values.
+            Span<int> bufBits = MemoryMarshal.Cast<float, int>(buf.AsSpan());
 
             if (!is_region_valid(x0, y0, x1, y1))
             {
@@ -147,7 +149,7 @@ namespace OpenJpeg.Internal
                                 {
                                     for (j = 0; j < y_incr; j++)
                                     {
-                                        buf[dest_ptr] = src_block[src_ptr];
+                                        bufBits[(int)(dest_ptr)] = src_block[src_ptr];
                                         dest_ptr += buf_line_stride;
                                         src_ptr += block_width;
                                     }
@@ -157,14 +159,14 @@ namespace OpenJpeg.Internal
                                     uint k;
                                     for (k = 0; k < (x_incr & ~3U); k += 4)
                                     {
-                                        buf[dest_ptr + k * buf_col_stride] = src_block[src_ptr + k];
-                                        buf[dest_ptr + (k + 1) * buf_col_stride] = src_block[src_ptr + k + 1];
-                                        buf[dest_ptr + (k + 2) * buf_col_stride] = src_block[src_ptr + k + 2];
-                                        buf[dest_ptr + (k + 3) * buf_col_stride] = src_block[src_ptr + k + 3];
+                                        bufBits[(int)(dest_ptr + k * buf_col_stride)] = src_block[src_ptr + k];
+                                        bufBits[(int)(dest_ptr + (k + 1) * buf_col_stride)] = src_block[src_ptr + k + 1];
+                                        bufBits[(int)(dest_ptr + (k + 2) * buf_col_stride)] = src_block[src_ptr + k + 2];
+                                        bufBits[(int)(dest_ptr + (k + 3) * buf_col_stride)] = src_block[src_ptr + k + 3];
                                     }
                                     for (; k < x_incr; k++)
                                     {
-                                        buf[dest_ptr + k * buf_col_stride] = src_block[src_ptr + k];
+                                        bufBits[(int)(dest_ptr + k * buf_col_stride)] = src_block[src_ptr + k];
                                     }
                                 }
                                 else if (x_incr >= 8 && buf_col_stride == 8)
@@ -174,14 +176,14 @@ namespace OpenJpeg.Internal
                                         uint k;
                                         for (k = 0; k < (x_incr & ~3U); k += 4)
                                         {
-                                            buf[dest_ptr + k * buf_col_stride] = src_block[src_ptr + k];
-                                            buf[dest_ptr + (k + 1) * buf_col_stride] = src_block[src_ptr + k + 1];
-                                            buf[dest_ptr + (k + 2) * buf_col_stride] = src_block[src_ptr + k + 2];
-                                            buf[dest_ptr + (k + 3) * buf_col_stride] = src_block[src_ptr + k + 3];
+                                            bufBits[(int)(dest_ptr + k * buf_col_stride)] = src_block[src_ptr + k];
+                                            bufBits[(int)(dest_ptr + (k + 1) * buf_col_stride)] = src_block[src_ptr + k + 1];
+                                            bufBits[(int)(dest_ptr + (k + 2) * buf_col_stride)] = src_block[src_ptr + k + 2];
+                                            bufBits[(int)(dest_ptr + (k + 3) * buf_col_stride)] = src_block[src_ptr + k + 3];
                                         }
                                         for (; k < x_incr; k++)
                                         {
-                                            buf[dest_ptr + k * buf_col_stride] = src_block[src_ptr + k];
+                                            bufBits[(int)(dest_ptr + k * buf_col_stride)] = src_block[src_ptr + k];
                                         }
                                         dest_ptr += buf_line_stride;
                                         src_ptr += block_width;
@@ -195,7 +197,7 @@ namespace OpenJpeg.Internal
                                         uint k;
                                         for (k = 0; k < x_incr; k++)
                                         {
-                                            buf[dest_ptr + k * buf_col_stride] = src_block[src_ptr + k];
+                                            bufBits[(int)(dest_ptr + k * buf_col_stride)] = src_block[src_ptr + k];
                                         }
                                         dest_ptr += buf_line_stride;
                                         src_ptr += block_width;
@@ -250,8 +252,7 @@ namespace OpenJpeg.Internal
                             {
                                 for (j = 0; j < y_incr; j++)
                                 {
-                                    iof.F = buf[src_ptr];
-                                    src_block[dest_ptr] = iof.I;
+                                    src_block[dest_ptr] = bufBits[(int)(src_ptr)];
                                     src_ptr += buf_line_stride;
                                     dest_ptr += block_width;
                                 }
@@ -263,19 +264,14 @@ namespace OpenJpeg.Internal
                                     uint k;
                                     for (k = 0; k < (x_incr & ~3U); k += 4)
                                     {
-                                        iof.F = buf[src_ptr + k * buf_col_stride];
-                                        src_block[dest_ptr + k] = iof.I;
-                                        iof.F = buf[src_ptr + (k + 1) * buf_col_stride];
-                                        src_block[dest_ptr + k + 1] = iof.I;
-                                        iof.F = buf[src_ptr + (k + 2) * buf_col_stride];
-                                        src_block[dest_ptr + k + 2] = iof.I;
-                                        iof.F = buf[src_ptr + (k + 3) * buf_col_stride];
-                                        src_block[dest_ptr + k + 3] = iof.I;
+                                        src_block[dest_ptr + k] = bufBits[(int)(src_ptr + k * buf_col_stride)];
+                                        src_block[dest_ptr + k + 1] = bufBits[(int)(src_ptr + (k + 1) * buf_col_stride)];
+                                        src_block[dest_ptr + k + 2] = bufBits[(int)(src_ptr + (k + 2) * buf_col_stride)];
+                                        src_block[dest_ptr + k + 3] = bufBits[(int)(src_ptr + (k + 3) * buf_col_stride)];
                                     }
                                     for (; k < x_incr; k++)
                                     {
-                                        iof.F = buf[src_ptr + k * buf_col_stride];
-                                        src_block[dest_ptr + k] = iof.I;
+                                        src_block[dest_ptr + k] = bufBits[(int)(src_ptr + k * buf_col_stride)];
                                     }
                                     src_ptr += buf_line_stride;
                                     dest_ptr += block_width;
@@ -289,8 +285,7 @@ namespace OpenJpeg.Internal
                                     uint k;
                                     for (k = 0; k < x_incr; k++)
                                     {
-                                        iof.F = buf[src_ptr + k * buf_col_stride];
-                                        src_block[dest_ptr + k] = iof.I;
+                                        src_block[dest_ptr + k] = bufBits[(int)(src_ptr + k * buf_col_stride)];
                                     }
                                     src_ptr += buf_line_stride;
                                     dest_ptr += block_width;

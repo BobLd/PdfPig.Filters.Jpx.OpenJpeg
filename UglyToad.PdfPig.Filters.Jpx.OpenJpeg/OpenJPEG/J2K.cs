@@ -1,5 +1,4 @@
-﻿#region License
-/*
+﻿/*
  * Copyright (c) 2002-2007, Communications and Remote Sensing Laboratory, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2007, Professor Benoit Macq
  * Copyright (c) 2001-2003, David Janssens
@@ -30,15 +29,12 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#endregion
-#region Using
+
 using System;
 using System.Diagnostics;
 using System.IO;
 using OpenJpeg.Internal;
-
 using OPJ_UINT32 = System.UInt32;
-#endregion
 
 namespace OpenJpeg
 {
@@ -48,8 +44,6 @@ namespace OpenJpeg
     /// </summary>
     internal sealed class J2K
     {
-        #region Variables and properties
-
         /// <summary>
         /// Size of the image.
         /// </summary>
@@ -143,17 +137,6 @@ namespace OpenJpeg
         /// </summary>
         public uint _ihdr_h;
 
-#if SUPPORT_DUMP_FLAG
-        /// <summary>
-        /// Used to select what information to dump about the code stream to a file or the console
-        /// </summary>
-        bool _dump_state;
-#endif
-
-        #endregion
-
-        #region Init
-
         private J2K(CompressionInfo cinfo)
         {
             _cinfo = cinfo;
@@ -197,10 +180,6 @@ namespace OpenJpeg
             return j2k;
         }
 
-        #endregion
-
-        #region Setup
-
         //2.5.3 - opj_j2k_setup_decoder
         internal void SetupDecode(CIO cio, DecompressionParameters parameters)
         {
@@ -209,10 +188,6 @@ namespace OpenJpeg
             {
                 _cp.specific_param.dec.layer = (uint)parameters.layer;
                 _cp.specific_param.dec.reduce = (uint)parameters.reduce;
-
-#if SUPPORT_DUMP_FLAG
-                _dump_state = (parameters.flags & DecompressionParameters.DPARAMETERS.DUMP_FLAG) != 0;
-#endif
             }
         }
 
@@ -1892,10 +1867,6 @@ namespace OpenJpeg
             return true;
         }
 
-        #endregion
-
-        #region Validation
-
         //2.5 - opj_j2k_encoding_validation
         bool EncodingValidation()
         {
@@ -1958,8 +1929,6 @@ namespace OpenJpeg
 
             return l_is_valid;
         }
-
-        #endregion
 
         /// <summary>
         /// Encodes an image into a JPEG-2000 codestream
@@ -3392,8 +3361,6 @@ namespace OpenJpeg
 
             return true;
         }
-
-        #region Decode image
 
         //2.5
         void AddTlmarker(OPJ_UINT32 tileno, J2K_Marker type, long pos, OPJ_UINT32 len)
@@ -5919,9 +5886,6 @@ namespace OpenJpeg
                 _cinfo.Error("Error with SIZ marker: illegal tile offset");
                 return false;
             }
-#if SUPPORT_DUMP_FLAG
-            if (!_dump_state)
-#endif
             {
                 uint siz_w = (uint) (_private_image.x1 - _private_image.x0);
                 uint siz_h = (uint) (_private_image.y1 - _private_image.y0);
@@ -5947,9 +5911,6 @@ namespace OpenJpeg
                 uint tmp = _cio.ReadByte();
                 comp.prec = (tmp & 0x7f) + 1;
                 comp.sgnd = (tmp >> 7) == 1;
-#if SUPPORT_DUMP_FLAG
-                if (!_dump_state)
-#endif
                 {
                     if (i == 0)
                     {
@@ -7252,10 +7213,6 @@ namespace OpenJpeg
             }
         }
 
-        #endregion
-
-        #region Helper functions
-
         //2.5.1 - opj_j2k_update_image_dimensions
         private bool UpdateImageDimensions(JPXImage image)
         {
@@ -7721,10 +7678,6 @@ namespace OpenJpeg
             }
 	    }
 
-#endregion
-
-#region Spesific params
-
         //[System.Runtime.InteropServices.StructLayoutAttribute(System.Runtime.InteropServices.LayoutKind.Explicit)]
         struct J2KEncOrDec
         {
@@ -8014,7 +7967,5 @@ namespace OpenJpeg
                 }
             }
         }
-
-#endregion
     }
 }
