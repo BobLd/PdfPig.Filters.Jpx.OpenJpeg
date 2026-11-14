@@ -72,8 +72,8 @@ internal sealed class TagTree
         tt._numleafsh = numleafsh;
         tt._numleafsv = numleafsv;
 
-        int[] nplh = new int[32];
-        int[] nplv = new int[32];
+        Span<int> nplh = stackalloc int[32];
+        Span<int> nplv = stackalloc int[32];
 
         int numlvls = 0;
         nplh[0] = (int)numleafsh;
@@ -177,8 +177,8 @@ internal sealed class TagTree
         this._numleafsh = num_leafs_h;
         this._numleafsv = num_leafs_v;
 
-        int[] nplh = new int[32];
-        int[] nplv = new int[32];
+        Span<int> nplh = stackalloc int[32];
+        Span<int> nplv = stackalloc int[32];
         int _num_levels = 0;
         nplh[0] = (int)_numleafsh;
         nplv[0] = (int)_numleafsv;

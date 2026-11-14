@@ -41,7 +41,7 @@ public sealed class CompressionInfo
     /// <summary>
     /// Version number of this libary
     /// </summary>
-    public static string Version => "2.5.3";
+    public static string Version => "2.5.4";
 
     /// <summary>
     /// Whenever this object is a decompressor or

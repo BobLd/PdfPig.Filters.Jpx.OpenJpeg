@@ -115,7 +115,7 @@ internal static class ht_dec
     /// u is the u value (or u_q) + 1.  Note: we produce u + 1
     /// this value is a partial calculation of u + kappa
     /// </param>
-    internal static uint decode_init_uvlc(uint vlc, uint mode, uint[] u)
+    internal static uint decode_init_uvlc(uint vlc, uint mode, Span<uint> u)
     {
         uint consumed_bits = 0;
         if (mode == 0)
@@ -216,7 +216,7 @@ internal static class ht_dec
     /// u is the u value (or u_q) + 1.  Note: we produce u + 1
     /// this value is a partial calculation of u + kappa
     /// </param>
-    internal static uint decode_noninit_uvlc(uint vlc, uint mode, uint[] u)
+    internal static uint decode_noninit_uvlc(uint vlc, uint mode, Span<uint> u)
     {
         uint consumed_bits = 0;
         if (mode == 0)

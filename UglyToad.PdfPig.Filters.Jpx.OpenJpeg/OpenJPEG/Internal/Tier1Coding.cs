@@ -1651,7 +1651,8 @@ internal sealed class Tier1Coding
         uint vlc_val;              // fetched data from VLC bitstream
         byte[] cblkdata;
         int cblkdata_pt;
-        uint[] qinf = new uint[2];
+        Span<uint> qinf = stackalloc uint[2]; // quad info decoded from the VLC bitstream
+        Span<uint> U_q = stackalloc uint[2]; // u values for the quad pair, reused by every iteration
         bool stripe_causal = (cblksty & CCP_CBLKSTY.VSC) != 0;
 
         if (roishift != 0)
@@ -1893,7 +1894,6 @@ internal sealed class Tier1Coding
 
         for (int x = 0; x < width; x += 4)
         { // one iteration per quad pair
-            uint[] U_q = new uint[2]; // u values for the quad pair
             uint m_n, v_n;
             uint ms_val;
 
@@ -2228,7 +2228,6 @@ internal sealed class Tier1Coding
             c_q = 0;                        // context
             for (int x = 0; x < width; x += 4)
             {
-                uint[] U_q = new uint[2];
                 uint m_n, v_n;
                 uint ms_val;
 
