@@ -1,6 +1,6 @@
 ﻿# Decoder performance: findings
 
-State of the managed decoder after the work on branch `feature/refactor` (commits `9ac0cac` to `37b7a76`),
+State of the managed decoder after the work on branch `feature/refactor` (commits `9ac0cac` to `737844e`),
 compared with the original port (`master`, `8b39066`) and with upstream C OpenJPEG (commit `8314119b`, built with
 `/arch:AVX2 /D__SSE__ /D__SSE2__`, see `tools/reference/build.ps1 -Simd`).
 
@@ -969,6 +969,22 @@ values as upstream, different memory traffic:
   `ArgumentNullException`. It only happens when a pooled per-thread instance starts on such a block, so it depends
   on thread timing. Parity found it once on `a3_mono.j2c` with `DOTNET_EnableAVX2=0`; it was there before this
   session's changes. The fix skips the clear when the buffer is null. No test reproduces it reliably.
+
+### Packet-header bit reader: `Read`/`Read0` and `ReadUInt`/`ReadUInt0` merged (`6a3939a`, `737844e`, refactor)
+
+- `BIO.Read` and `BIO.Read0` were the same code except at the end of the data: `Read` threw
+  `EndOfStreamException`, `Read0` read zero bits (the original behaviour, used by `ReadUInt0` and the 7-bit tail of
+  `GetNumPasses`). They are now one `Read(n, zeroAtEnd)` (`6a3939a`). It tests for the stuffed bit after a `0xFF`
+  byte before it loads the next byte, as both copies did. `ReadUInt` and `ReadUInt0` differed the same way and are
+  now one `ReadUInt(n, zeroAtEnd)` that passes the flag on to `Read` (`737844e`). No speed change expected (packet
+  headers are a small part of T2); none timed.
+- `BIO` has no replacement in .NET: the BCL has no bit-stream reader (`BinaryReader`, `BitArray`, `BinaryPrimitives`
+  and `BitOperations` work on bytes or single values), and a wrapper would still need the bit stuffing after `0xFF`
+  and the four end-of-data behaviours (`Read` throws, `Read(n, true)` gives zeros, `ReadBool` gives `false`,
+  `ByteAlign` skips the stuffed byte and reports the end).
+- Verification, after each commit: parity 315/315 and 1404/1404 in the default mode, tests 289/294 on net8.0.
+  Not run: the other parity modes (no SIMD, threading or area path in this code), net472, and counters showing that
+  a corpus file reaches the end-of-data branches.
 
 ## Things that did not help
 

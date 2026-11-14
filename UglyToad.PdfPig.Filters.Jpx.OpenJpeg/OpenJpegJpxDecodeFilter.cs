@@ -5,206 +5,205 @@ using UglyToad.PdfPig.Tokens;
 
 // Based on https://github.com/notBald/OpenJPEG.net README
 
-namespace UglyToad.PdfPig.Filters.Jpx.OpenJpeg
+namespace UglyToad.PdfPig.Filters.Jpx.OpenJpeg;
+
+/// <summary>
+/// JPX Filter for image data.
+/// <para>
+/// Based on <see href="https://github.com/notBald/OpenJPEG.net"/>.
+/// </para>
+/// </summary>
+public sealed class OpenJpegJpxDecodeFilter : IFilter
 {
-    /// <summary>
-    /// JPX Filter for image data.
-    /// <para>
-    /// Based on <see href="https://github.com/notBald/OpenJPEG.net"/>.
-    /// </para>
-    /// </summary>
-    public sealed class OpenJpegJpxDecodeFilter : IFilter
+    /// <inheritdoc/>
+    public bool IsSupported => true;
+
+    /// <inheritdoc/>
+    public Memory<byte> Decode(Memory<byte> input, DictionaryToken streamDictionary, IFilterProvider filterProvider, int filterIndex)
     {
-        /// <inheritdoc/>
-        public bool IsSupported => true;
+        var codecFormat = GetCodecFormat(input.Span);
 
-        /// <inheritdoc/>
-        public Memory<byte> Decode(Memory<byte> input, DictionaryToken streamDictionary, IFilterProvider filterProvider, int filterIndex)
+        // OpenJpeg.Net uses the OpenJpeg 1.4 API
+        var cInfo = new CompressionInfo(true, codecFormat);
+
+        // PDF 2.0, 7.4.9: when the image dictionary has its own /ColorSpace entry, that colour
+        // space governs how the decoded samples are interpreted - not any colour space info
+        // embedded in the JPEG2000 data. If the JP2 also embeds a palette (pclr/cmap boxes),
+        // e.g. because /ColorSpace is itself Indexed, the raw codestream only carries one
+        // component (a palette index) per pixel. Left to its own devices the decoder applies
+        // that embedded palette automatically and hands back 3-component RGB samples instead,
+        // which no longer matches what the declared /ColorSpace (and PdfPig's colour-space byte
+        // converter) expects - corrupting the image (see Caly issue: JPXDecode + Indexed
+        // /ColorSpace renders as scrambled noise). Suppress the automatic palette application in
+        // that case so the filter always returns raw per-codestream-component samples.
+        bool hasExplicitColorSpace = streamDictionary.ContainsKey(NameToken.ColorSpace);
+
+        // Sets up decoding parameters. Can for instance be used to
+        // speed up decoding of thumbnails by decoding less resolutions
+        var parameters = new DecompressionParameters
         {
-            var codecFormat = GetCodecFormat(input.Span);
+            IgnoreColorLookupTable = hasExplicitColorSpace
+        };
 
-            // OpenJpeg.Net uses the OpenJpeg 1.4 API
-            var cInfo = new CompressionInfo(true, codecFormat);
+        // Destination for the decoded image
+        JPXImage? img = null;
 
-            // PDF 2.0, 7.4.9: when the image dictionary has its own /ColorSpace entry, that colour
-            // space governs how the decoded samples are interpreted - not any colour space info
-            // embedded in the JPEG2000 data. If the JP2 also embeds a palette (pclr/cmap boxes),
-            // e.g. because /ColorSpace is itself Indexed, the raw codestream only carries one
-            // component (a palette index) per pixel. Left to its own devices the decoder applies
-            // that embedded palette automatically and hands back 3-component RGB samples instead,
-            // which no longer matches what the declared /ColorSpace (and PdfPig's colour-space byte
-            // converter) expects - corrupting the image (see Caly issue: JPXDecode + Indexed
-            // /ColorSpace renders as scrambled noise). Suppress the automatic palette application in
-            // that case so the filter always returns raw per-codestream-component samples.
-            bool hasExplicitColorSpace = streamDictionary.ContainsKey(NameToken.ColorSpace);
+        using (var ms = MemoryHelper.AsReadOnlyMemoryStream(input))
+        {
+            // cio is a wrapper that is used by the libary when
+            // reading. A bit like "BinaryReader"
+            var cio = cInfo.OpenCIO(ms, true);
+            cInfo.SetupDecoder(cio, parameters);
 
-            // Sets up decoding parameters. Can for instance be used to
-            // speed up decoding of thumbnails by decoding less resolutions
-            var parameters = new DecompressionParameters
+            //Decodes the image
+            bool readHeader = cInfo.ReadHeader(out img);
+            if (!readHeader)
             {
-                IgnoreColorLookupTable = hasExplicitColorSpace
-            };
-
-            // Destination for the decoded image
-            JPXImage? img = null;
-
-            using (var ms = MemoryHelper.AsReadOnlyMemoryStream(input))
-            {
-                // cio is a wrapper that is used by the libary when
-                // reading. A bit like "BinaryReader"
-                var cio = cInfo.OpenCIO(ms, true);
-                cInfo.SetupDecoder(cio, parameters);
-
-                //Decodes the image
-                bool readHeader = cInfo.ReadHeader(out img);
-                if (!readHeader)
-                {
-                    throw new Exception("Failed to read JPX header.");
-                }
-
-                bool decode = cInfo.Decode(img);
-                if (!decode)
-                {
-                    // See GHOSTSCRIPT-695241-0.pdf
-                    throw new Exception("Failed to decode JPX.");
-                }
-
-                bool endDecompress = cInfo.EndDecompress();
-                if (!endDecompress)
-                {
-                    throw new Exception("Failed to end JPX decompression.");
-                }
-
-                //If there's an error, you won't get an image. To get the error message,
-                //set up cinfo with message callback functions
-                if (img is null)
-                {
-                    throw new NullReferenceException("Something wrong happened while getting JPX image.");
-                }
+                throw new Exception("Failed to read JPX header.");
             }
 
-            // Makes the bits per channel uniform so that it's easier
-            // to work with.
-            img.MakeUniformBPC();
-
-            // Jpeg 2000 images can have a color palette. Only apply it here when the PDF itself
-            // doesn't declare a /ColorSpace: in that case PdfPig falls back to the colour space
-            // embedded in the JPX data (Jpeg2000Helper.GetJpxColorSpaceDetails), which expects
-            // palette-expanded samples. When /ColorSpace is present, IgnoreColorLookupTable above
-            // already suppressed the automatic application, and the raw index samples must be left
-            // alone for the declared /ColorSpace (and its own lookup table) to interpret.
-            if (!hasExplicitColorSpace)
+            bool decode = cInfo.Decode(img);
+            if (!decode)
             {
-                img.ApplyIndex();
+                // See GHOSTSCRIPT-695241-0.pdf
+                throw new Exception("Failed to decode JPX.");
             }
 
-            //Handle some color spaces.
-            switch (img.ColorSpace)
+            bool endDecompress = cInfo.EndDecompress();
+            if (!endDecompress)
             {
-                case COLOR_SPACE.YCCK:
-                    if (!img.ESyccToRGB())
-                    {
-                        throw new Exception("Failed to RGB convert image");
-                    }
-                    break;
-            }
-            // Note, we don't here handle grayscale or CMY format. 
-
-            // PDF 2.0, 8.9.5.1: BitsPerComponent "shall be ignored" for JPXDecode, but PdfPig uses it when present
-            // to read the decoded bytes. If it disagrees with the codestream (e.g. 4-bit JPX with
-            // /BitsPerComponent 8, GHOSTSCRIPT-696255-0.pdf), rescale the samples to the declared depth.
-            if (streamDictionary.TryGet(NameToken.BitsPerComponent, out NumericToken? bpcToken))
-            {
-                int bpc = bpcToken.Int;
-                if (bpc is 1 or 2 or 4 or 8 or 16 && bpc != img.MaxBPC && !MayBeIndexed(streamDictionary))
-                {
-                    ScaleToBitsPerComponent(img, bpc);
-                }
+                throw new Exception("Failed to end JPX decompression.");
             }
 
-            // Assembles the image into a stream of bytes
-            using (var ms = img.ToMemoryStream())
+            //If there's an error, you won't get an image. To get the error message,
+            //set up cinfo with message callback functions
+            if (img is null)
             {
-                return ms.AsMemory();
+                throw new NullReferenceException("Something wrong happened while getting JPX image.");
             }
         }
 
-        /// <summary>
-        /// Linear full-range rescale (max maps to max), like <see cref="JPXImage.MakeUniformBPC"/>.
-        /// Signed components are left alone: PDF samples are unsigned.
-        /// </summary>
-        private static void ScaleToBitsPerComponent(JPXImage img, int bpc)
+        // Makes the bits per channel uniform so that it's easier
+        // to work with.
+        img.MakeUniformBPC();
+
+        // Jpeg 2000 images can have a color palette. Only apply it here when the PDF itself
+        // doesn't declare a /ColorSpace: in that case PdfPig falls back to the colour space
+        // embedded in the JPX data (Jpeg2000Helper.GetJpxColorSpaceDetails), which expects
+        // palette-expanded samples. When /ColorSpace is present, IgnoreColorLookupTable above
+        // already suppressed the automatic application, and the raw index samples must be left
+        // alone for the declared /ColorSpace (and its own lookup table) to interpret.
+        if (!hasExplicitColorSpace)
         {
-            foreach (var comp in img.Components)
-            {
-                if (comp.Signed || comp.Prec == bpc || comp.Prec <= 0 || comp.Prec > 30)
+            img.ApplyIndex();
+        }
+
+        //Handle some color spaces.
+        switch (img.ColorSpace)
+        {
+            case COLOR_SPACE.YCCK:
+                if (!img.ESyccToRGB())
                 {
-                    continue;
+                    throw new Exception("Failed to RGB convert image");
                 }
-
-                long oldMax = (1L << comp.Prec) - 1, newMax = (1L << bpc) - 1;
-                var data = comp.Data;
-                for (int i = 0; i < data.Length; i++)
-                {
-                    long v = Math.Min(Math.Max(data[i], 0), oldMax);
-                    data[i] = (int)((v * newMax + oldMax / 2) / oldMax);
-                }
-                comp.SetPrecision(bpc);
-            }
+                break;
         }
+        // Note, we don't here handle grayscale or CMY format. 
 
-        /// <summary>
-        /// Indexed samples are palette indices, which must never be rescaled. An unresolved reference
-        /// counts as possibly indexed: this filter has no access to the document to look it up.
-        /// </summary>
-        private static bool MayBeIndexed(DictionaryToken streamDictionary)
+        // PDF 2.0, 8.9.5.1: BitsPerComponent "shall be ignored" for JPXDecode, but PdfPig uses it when present
+        // to read the decoded bytes. If it disagrees with the codestream (e.g. 4-bit JPX with
+        // /BitsPerComponent 8, GHOSTSCRIPT-696255-0.pdf), rescale the samples to the declared depth.
+        if (streamDictionary.TryGet(NameToken.BitsPerComponent, out NumericToken bpcToken))
         {
-            if (!streamDictionary.TryGet(NameToken.ColorSpace, out var cs) || cs is NameToken)
+            int bpc = bpcToken.Int;
+            if (bpc is 1 or 2 or 4 or 8 or 16 && bpc != img.MaxBPC && !MayBeIndexed(streamDictionary))
             {
-                return false;
+                ScaleToBitsPerComponent(img, bpc);
             }
-
-            return cs is not ArrayToken array ||
-                   (array.Data.Count > 0 && array.Data[0] is NameToken name &&
-                    (name.Equals(NameToken.Indexed) || name.Data == "I"));
         }
 
-        /// <summary>
-        /// Get bits per component values for Jp2 (Jpx) encoded images (first component).
-        /// </summary>
-        private static CodecFormat GetCodecFormat(ReadOnlySpan<byte> jp2Bytes)
+        // Assembles the image into a stream of bytes
+        using (var ms = img.ToMemoryStream())
         {
-            // Ensure the input has at least 12 bytes for the signature box
-            if (jp2Bytes.Length < 12)
-            {
-                throw new InvalidOperationException("Input is too short to be a valid JPEG2000 file.");
-            }
-
-            // Verify the JP2 signature box
-            uint length = BinaryPrimitives.ReadUInt32BigEndian(jp2Bytes.Slice(0, 4));
-            if (length == 0xFF4FFF51)
-            {
-                // J2K format detected (SOC marker) (See GHOSTSCRIPT-688999-2.pdf)
-                return CodecFormat.Jpeg2K;
-            }
-
-            uint type = BinaryPrimitives.ReadUInt32BigEndian(jp2Bytes.Slice(4, 4));
-            uint magic = BinaryPrimitives.ReadUInt32BigEndian(jp2Bytes.Slice(8, 4));
-            if (length == 0x0000000C && type == 0x6A502020 && magic == 0x0D0A870A)
-            {
-                // JP2 format detected
-                return CodecFormat.Jpeg2P;
-            }
-
-            /*
-            if (length == 0x0000000C && type == 0x6A502058 && magic == 0x0D0A870A)
-            {
-                // JPX format detected
-                return CodecFormat.Jpx;
-            }
-            */
-
-            throw new InvalidOperationException("Invalid JP2 or J2K signature.");
+            return ms.AsMemory();
         }
+    }
+
+    /// <summary>
+    /// Linear full-range rescale (max maps to max), like <see cref="JPXImage.MakeUniformBPC"/>.
+    /// Signed components are left alone: PDF samples are unsigned.
+    /// </summary>
+    private static void ScaleToBitsPerComponent(JPXImage img, int bpc)
+    {
+        foreach (var comp in img.Components)
+        {
+            if (comp.Signed || comp.Prec == bpc || comp.Prec <= 0 || comp.Prec > 30)
+            {
+                continue;
+            }
+
+            long oldMax = (1L << comp.Prec) - 1, newMax = (1L << bpc) - 1;
+            var data = comp.Data;
+            for (int i = 0; i < data.Length; i++)
+            {
+                long v = Math.Min(Math.Max(data[i], 0), oldMax);
+                data[i] = (int)((v * newMax + oldMax / 2) / oldMax);
+            }
+            comp.SetPrecision(bpc);
+        }
+    }
+
+    /// <summary>
+    /// Indexed samples are palette indices, which must never be rescaled. An unresolved reference
+    /// counts as possibly indexed: this filter has no access to the document to look it up.
+    /// </summary>
+    private static bool MayBeIndexed(DictionaryToken streamDictionary)
+    {
+        if (!streamDictionary.TryGet(NameToken.ColorSpace, out var cs) || cs is NameToken)
+        {
+            return false;
+        }
+
+        return cs is not ArrayToken array ||
+               (array.Data.Count > 0 && array.Data[0] is NameToken name &&
+                (name.Equals(NameToken.Indexed) || name.Data == "I"));
+    }
+
+    /// <summary>
+    /// Get bits per component values for Jp2 (Jpx) encoded images (first component).
+    /// </summary>
+    private static CodecFormat GetCodecFormat(ReadOnlySpan<byte> jp2Bytes)
+    {
+        // Ensure the input has at least 12 bytes for the signature box
+        if (jp2Bytes.Length < 12)
+        {
+            throw new InvalidOperationException("Input is too short to be a valid JPEG2000 file.");
+        }
+
+        // Verify the JP2 signature box
+        uint length = BinaryPrimitives.ReadUInt32BigEndian(jp2Bytes.Slice(0, 4));
+        if (length == 0xFF4FFF51)
+        {
+            // J2K format detected (SOC marker) (See GHOSTSCRIPT-688999-2.pdf)
+            return CodecFormat.Jpeg2K;
+        }
+
+        uint type = BinaryPrimitives.ReadUInt32BigEndian(jp2Bytes.Slice(4, 4));
+        uint magic = BinaryPrimitives.ReadUInt32BigEndian(jp2Bytes.Slice(8, 4));
+        if (length == 0x0000000C && type == 0x6A502020 && magic == 0x0D0A870A)
+        {
+            // JP2 format detected
+            return CodecFormat.Jpeg2P;
+        }
+
+        /*
+        if (length == 0x0000000C && type == 0x6A502058 && magic == 0x0D0A870A)
+        {
+            // JPX format detected
+            return CodecFormat.Jpx;
+        }
+        */
+
+        throw new InvalidOperationException("Invalid JP2 or J2K signature.");
     }
 }

@@ -30,83 +30,79 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-using System;
+namespace OpenJpeg.Internal;
 
-namespace OpenJpeg.Internal
+/// <summary>
+/// Progression order changes
+/// </summary>
+public class ProgOrdChang : ICloneable
 {
     /// <summary>
-    /// Progression order changes
+    /// Resolution num start, Component num start, given by POC
     /// </summary>
-    public class ProgOrdChang : ICloneable
+    public uint resno0, compno0;
+
+    /// <summary>
+    /// Layer num end,Resolution num end, Component num end, given by POC
+    /// </summary>
+    public uint layno1, resno1, compno1;
+
+    /// <summary>
+    /// Layer num start,Precinct num start, Precinct num end
+    /// </summary>
+    internal uint layno0, precno0, precno1;
+
+    /// <summary>
+    /// Progression order enum
+    /// </summary>
+    public PROG_ORDER prg1;
+
+    /// <summary>
+    /// Progression order enum
+    /// </summary>
+    internal PROG_ORDER prg;
+
+    /// <summary>
+    /// Progression order string
+    /// </summary>
+    /// <remarks>
+    /// C# Not used for anything except for converting to pgr1, so I've just
+    ///    made it an enum from the start
+    /// </remarks>
+    public PROG_ORDER progorder;
+
+    /// <summary>
+    /// Tile number
+    /// </summary>
+    public uint tile;
+
+    /// <summary>
+    /// Start and end values for Tile width and height
+    /// </summary>
+    internal uint tx0, tx1, ty0, ty1;
+
+    /// <summary>
+    /// Start value, initialised in pi_initialise_encode
+    /// </summary>
+    internal uint layS, resS, compS, prcS;
+
+    /// <summary>
+    /// End value, initialised in pi_initialise_encode
+    /// </summary>
+    internal uint layE, resE, compE, prcE;
+
+    /// <summary>
+    /// Start and end values of Tile width and height, initialised in pi_initialise_encode
+    /// </summary>
+    internal uint txS, txE, tyS, tyE, dx, dy;
+
+    /// <summary>
+    /// Temporary values for Tile parts, initialised in pi_create_encode
+    /// </summary>
+    internal uint lay_t, res_t, comp_t, prc_t, tx0_t, ty0_t;
+
+    public object Clone()
     {
-        /// <summary>
-        /// Resolution num start, Component num start, given by POC
-        /// </summary>
-	    public uint resno0, compno0;
-	    
-        /// <summary>
-        /// Layer num end,Resolution num end, Component num end, given by POC
-        /// </summary>
-	    public uint layno1, resno1, compno1;
-	    
-        /// <summary>
-        /// Layer num start,Precinct num start, Precinct num end
-        /// </summary>
-	    internal uint layno0, precno0, precno1;
-	    
-        /// <summary>
-        /// Progression order enum
-        /// </summary>
-	    public PROG_ORDER prg1;
-
-        /// <summary>
-        /// Progression order enum
-        /// </summary>
-        internal PROG_ORDER prg;
-	    
-        /// <summary>
-        /// Progression order string
-        /// </summary>
-        /// <remarks>
-        /// C# Not used for anything except for converting to pgr1, so I've just
-        ///    made it an enum from the start
-        /// </remarks>
-        public PROG_ORDER progorder;
-	    
-        /// <summary>
-        /// Tile number
-        /// </summary>
-	    public uint tile;
-	    
-        /// <summary>
-        /// Start and end values for Tile width and height
-        /// </summary>
-	    internal uint tx0,tx1,ty0,ty1;
-	    
-        /// <summary>
-        /// Start value, initialised in pi_initialise_encode
-        /// </summary>
-	    internal uint layS, resS, compS, prcS;
-	    
-        /// <summary>
-        /// End value, initialised in pi_initialise_encode
-        /// </summary>
-	    internal uint layE, resE, compE, prcE;
-	    
-        /// <summary>
-        /// Start and end values of Tile width and height, initialised in pi_initialise_encode
-        /// </summary>
-	    internal uint txS,txE,tyS,tyE,dx,dy;
-	    
-        /// <summary>
-        /// Temporary values for Tile parts, initialised in pi_create_encode
-        /// </summary>
-	    internal uint lay_t, res_t, comp_t, prc_t,tx0_t,ty0_t;
-
-        public object Clone()
-        {
-            var poc = (ProgOrdChang) MemberwiseClone();
-            return poc;
-        }
+        return MemberwiseClone();
     }
 }

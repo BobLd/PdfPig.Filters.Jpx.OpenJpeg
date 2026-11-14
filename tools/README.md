@@ -89,3 +89,15 @@ dotnet publish benchmarks/aot -c Release -r win-x64 -o .reference/aot
 .reference/aot/AotDecode.exe 10
 dotnet run -c Release --project benchmarks/aot -- 10   # same harness under the JIT, for comparison
 ```
+
+## tidy/ — mechanical tidy-up of one source file
+
+Applies the form-only rules of `documentation/tidy-up-progress.md` (file-scoped namespace, missing `private`, locals in
+their innermost scope, braces, formatting, ...) to one file. It never changes behaviour; build every target and run the
+parity checks afterwards.
+
+```powershell
+dotnet run tools/tidy/tidy.cs -- <file> ns,mods,else,bare,static,locals,braces,format [--dry]
+```
+
+Steps are listed in the header of `tidy.cs`. `--dry` reports what would change without writing.
